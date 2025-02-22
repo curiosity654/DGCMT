@@ -9,6 +9,8 @@
 # ------------------------------------------------------------------------
 
 import numpy as np
+from os import path as osp
+from copy import deepcopy
 from mmdet.datasets import DATASETS
 from mmdet3d.datasets import NuScenesDataset
 
@@ -45,10 +47,13 @@ class CustomNuScenesDataset(NuScenesDataset):
         """
         info = self.data_infos[index]
         # standard protocal modified from SECOND.Pytorch
+        sweeps = deepcopy(info['sweeps'])
+        for sweep in sweeps:
+            sweep['data_path'] = osp.join(self.data_root, sweep['data_path'])
         input_dict = dict(
             sample_idx=info['token'],
-            pts_filename=info['lidar_path'],
-            sweeps=info['sweeps'],
+            pts_filename=osp.join(self.data_root, info['lidar_path']),
+            sweeps=sweeps,
             timestamp=info['timestamp'] / 1e6,
             img_sweeps=None if 'img_sweeps' not in info else info['img_sweeps'],
             radar_info=None if 'radars' not in info else info['radars']
@@ -65,7 +70,7 @@ class CustomNuScenesDataset(NuScenesDataset):
             img_timestamp = []
             for cam_type, cam_info in info['cams'].items():
                 img_timestamp.append(cam_info['timestamp'] / 1e6)
-                image_paths.append(cam_info['data_path'])
+                image_paths.append(osp.join(self.data_root, cam_info['data_path']))
                 # obtain lidar to image transformation matrix
                 lidar2cam_r = np.linalg.inv(cam_info['sensor2lidar_rotation'])
                 lidar2cam_t = cam_info[

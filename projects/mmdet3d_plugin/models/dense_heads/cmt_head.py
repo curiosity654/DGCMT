@@ -763,7 +763,7 @@ class CmtHead(BaseModule):
         known_labels, known_bboxs = mask_dict['known_lbs_bboxes']
         map_known_indice = mask_dict['map_known_indice'].long()
         known_indice = mask_dict['known_indice'].long()
-        batch_idx = mask_dict['batch_idx'].long()
+        batch_idx = mask_dict['batch_idx'].long().to(known_indice.device)
         bid = batch_idx[known_indice]
         known_labels_raw = mask_dict['known_labels_raw']
         
