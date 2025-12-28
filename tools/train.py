@@ -93,7 +93,7 @@ def parse_args():
         choices=['none', 'pytorch', 'slurm', 'mpi'],
         default='none',
         help='job launcher')
-    parser.add_argument('--local_rank', type=int, default=0)
+    parser.add_argument('--local-rank', type=int, default=0)
     parser.add_argument(
         '--autoscale-lr',
         action='store_true',
@@ -151,7 +151,7 @@ def main():
                 print(_module_path)
                 plg_lib = importlib.import_module(_module_path)
                 
-    plg_lib = importlib.import_module('mmdetection3d.mmdet3d')
+    # plg_lib = importlib.import_module('mmdetection3d.mmdet3d')
 
     # set cudnn_benchmark
     if cfg.get('cudnn_benchmark', False):
