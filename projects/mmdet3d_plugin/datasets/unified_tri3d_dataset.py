@@ -415,19 +415,56 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
             nusc_eval.sample_tokens = list(nusc_annos.keys())
             print(f"Forcing evaluation on {len(nusc_eval.sample_tokens)} mini split samples")
 
-        metrics = nusc_eval.main(plot_examples=0)
+        nusc_eval.main(plot_examples=0)
         
-        # Metrics summary
-        if hasattr(metrics, 'to_dict'):
-            detail = metrics.to_dict()['metrics_summary']
-        elif isinstance(metrics, dict) and 'metrics_summary' in metrics:
-            detail = metrics['metrics_summary']
-        else:
-            detail = metrics
+        # Load metrics from the saved JSON file (this ensures proper serialization)
+        metrics = mmcv.load(osp.join(osp.dirname(jsonfile_prefix), 'metrics_summary.json'))
+        
+        # Build a flat dictionary of scalar values for logging
+        detail = dict()
+        metric_prefix = 'pts_bbox_NuScenes'
+        
+        # Per-class AP at different distances
+        if 'label_aps' in metrics:
+            for name in self.CLASSES:
+                if name in metrics['label_aps']:
+                    for k, v in metrics['label_aps'][name].items():
+                        val = float('{:.4f}'.format(v))
+                        detail['{}/{}_AP_dist_{}'.format(metric_prefix, name, k)] = val
+        
+        # Per-class true positive errors
+        if 'label_tp_errors' in metrics:
+            for name in self.CLASSES:
+                if name in metrics['label_tp_errors']:
+                    for k, v in metrics['label_tp_errors'][name].items():
+                        val = float('{:.4f}'.format(v))
+                        detail['{}/{}_{}'.format(metric_prefix, name, k)] = val
+        
+        # Mean true positive errors
+        ErrNameMapping = {
+            'trans_err': 'mATE',
+            'scale_err': 'mASE',
+            'orient_err': 'mAOE',
+            'vel_err': 'mAVE',
+            'attr_err': 'mAAE'
+        }
+        if 'tp_errors' in metrics:
+            for k, v in metrics['tp_errors'].items():
+                val = float('{:.4f}'.format(v))
+                detail['{}/{}'.format(metric_prefix, ErrNameMapping.get(k, k))] = val
+        
+        # Overall metrics
+        if 'nd_score' in metrics:
+            detail['{}/NDS'.format(metric_prefix)] = float('{:.4f}'.format(metrics['nd_score']))
+        if 'mean_ap' in metrics:
+            detail['{}/mAP'.format(metric_prefix)] = float('{:.4f}'.format(metrics['mean_ap']))
             
-        if isinstance(detail, dict):
-            for key in detail:
-                print(f"{key}: {detail[key]}")
+        # Print summary
+        print(f"\n{'='*50}")
+        print(f"Evaluation Results:")
+        print(f"  NDS: {detail.get('NuScenes/NDS', 'N/A')}")
+        print(f"  mAP: {detail.get('NuScenes/mAP', 'N/A')}")
+        print(f"{'='*50}\n")
             
         # Clean up
         if tmp_dir is not None:
