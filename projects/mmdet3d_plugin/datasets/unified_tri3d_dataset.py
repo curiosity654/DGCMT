@@ -52,6 +52,32 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
         'movable_object.trafficcone': 'traffic_cone',
     }
 
+    # nuScenes official attributes mapping
+    ATTR_TABLE = [
+        "cycle.with_rider",
+        "cycle.without_rider",
+        "pedestrian.moving",
+        "pedestrian.standing",
+        "pedestrian.sitting_lying_down",
+        "vehicle.moving",
+        "vehicle.parked",
+        "vehicle.stopped",
+    ]
+
+    # Map categories to a default attribute for fallback
+    DEFAULT_ATTR = {
+        'car': 'vehicle.parked',
+        'pedestrian': 'pedestrian.moving',
+        'trailer': 'vehicle.parked',
+        'truck': 'vehicle.parked',
+        'bus': 'vehicle.moving',
+        'motorcycle': 'cycle.without_rider',
+        'construction_vehicle': 'vehicle.parked',
+        'bicycle': 'cycle.without_rider',
+        'barrier': '',
+        'traffic_cone': '',
+    }
+
     def __init__(self, 
                  dataset_type, 
                  data_root, 
@@ -198,69 +224,120 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
         """Used by CBGSDataset."""
         return self.data_infos[idx].get('cat_ids', [])
 
+    def _get_heuristic_attr(self, cls_name, velocity):
+        """Heuristic to assign attributes based on velocity, matching NuScenesDataset."""
+        vel_norm = np.sqrt(velocity[0]**2 + velocity[1]**2)
+        if vel_norm > 0.2:
+            if cls_name in [
+                    'car', 'construction_vehicle', 'bus', 'truck', 'trailer'
+            ]:
+                return 'vehicle.moving'
+            elif cls_name in ['bicycle', 'motorcycle']:
+                return 'cycle.with_rider'
+            else:
+                return self.DEFAULT_ATTR.get(cls_name, '')
+        else:
+            if cls_name in ['pedestrian']:
+                return 'pedestrian.standing'
+            elif cls_name in ['bus']:
+                return 'vehicle.stopped'
+            else:
+                return self.DEFAULT_ATTR.get(cls_name, '')
+
     def _format_bbox(self, results, sample_token, seq=None, frame=None, sensor=None):
         """Convert predictions to NuScenes format."""
         nusc_annos = []
-        if 'pts_bbox' in results:
-            bboxes = results['pts_bbox']['boxes_3d']
-            scores = results['pts_bbox']['scores_3d']
-            labels = results['pts_bbox']['labels_3d']
+        if "pts_bbox" in results:
+            bboxes = results["pts_bbox"]["boxes_3d"]
+            scores = results["pts_bbox"]["scores_3d"]
+            labels = results["pts_bbox"]["labels_3d"]
+            attr_labels = results["pts_bbox"].get("attr_labels_3d")
         else:
-            bboxes = results['boxes_3d']
-            scores = results['scores_3d']
-            labels = results['labels_3d']
+            bboxes = results["boxes_3d"]
+            scores = results["scores_3d"]
+            labels = results["labels_3d"]
+            attr_labels = results.get("attr_labels_3d")
 
         # LiDARInstance3DBoxes to numpy
         bboxes_tensor = bboxes.tensor.cpu().numpy()
         scores = scores.cpu().numpy()
         labels = labels.cpu().numpy()
+        if attr_labels is not None:
+            attr_labels = attr_labels.cpu().numpy()
 
         # Get sensor to world transform
         if seq is not None and frame is not None and sensor is not None:
             # tri3d_dataset.poses(seq, sensor) returns a batched transform
             # which is Tri3D_LIDAR to World
             sensor2world = self.tri3d_dataset.poses(seq, sensor)[frame]
-            
+
             # The model was trained on native NuScenes LIDAR frame (via LoadPointsFromTri3D)
             # native_LIDAR = Rot(-90) @ Tri3D_LIDAR  => Tri3D_LIDAR = Rot(90) @ native_LIDAR
             # So native_LIDAR to World = Tri3D_LIDAR to World @ Rot(90)
-            native2tri3d = RigidTransform(Rotation.from_euler('Z', np.pi / 2), [0, 0, 0])
+            native2tri3d = RigidTransform(Rotation.from_euler("Z", np.pi / 2), [0, 0, 0])
             native2world = sensor2world @ native2tri3d
         else:
             native2world = None
 
         for i in range(len(bboxes_tensor)):
-            # LiDARInstance3DBoxes for NuScenes: [x, y, z, l, w, h, yaw, ...]
+            # LiDARInstance3DBoxes for NuScenes: [x, y, z, l, w, h, yaw, vx, vy]
             # NuScenes expects: [x, y, z] for translation, [w, l, h] for size
             x, y, z, l, w, h, yaw = bboxes_tensor[i, :7]
-            
+
             if native2world is not None:
                 # Create box to native LIDAR transform
                 # Translation is [x, y, z], Rotation is around Z
-                box2native = RigidTransform(Rotation.from_euler('Z', yaw), [x, y, z])
-                
+                box2native = RigidTransform(Rotation.from_euler("Z", yaw), [x, y, z])
+
                 # Box to world
                 box2world = native2world @ box2native
-                
+
                 # Get global translation and rotation
                 trans = box2world.translation.vec
-                quat = box2world.rotation.quat # [w, x, y, z]
+                quat = box2world.rotation.quat  # [w, x, y, z]
+
+                # 3. Velocity rotation:
+                if bboxes_tensor.shape[1] >= 9:
+                    vx, vy = bboxes_tensor[i, 7:9]
+                    vel_native = np.array([vx, vy, 0.0])
+                    # Rotate velocity to world frame (vector rotation only)
+                    vel_world = native2world.apply(vel_native) - native2world.apply(
+                        np.zeros(3)
+                    )
+                    trans_vel = [float(vel_world[0]), float(vel_world[1])]
+                else:
+                    trans_vel = [0.0, 0.0]
             else:
                 # Fallback
                 trans = [x, y, z]
                 quat = Quaternion(axis=[0, 0, 1], radians=yaw).elements
-            
-            # NuScenes box origin is center (0.5, 0.5, 0.5), which matches our boxes_3d origin
-            
+                trans_vel = [0.0, 0.0]
+
+            # 4. Attribute mapping
+            cls_name = self.CLASSES[labels[i]]
+            if attr_labels is not None:
+                attr_idx = attr_labels[i]
+                if 0 <= attr_idx < len(self.ATTR_TABLE):
+                    attr_name = self.ATTR_TABLE[attr_idx]
+                else:
+                    attr_name = self._get_heuristic_attr(cls_name, trans_vel)
+            else:
+                attr_name = self._get_heuristic_attr(cls_name, trans_vel)
+
             nusc_anno = dict(
                 sample_token=sample_token,
                 translation=[float(trans[0]), float(trans[1]), float(trans[2])],
-                size=[float(w), float(l), float(h)], # NuScenes results.json expects [w, l, h]
-                rotation=[float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3])],
-                velocity=[0.0, 0.0],
-                detection_name=self.CLASSES[labels[i]],
+                size=[float(w), float(l), float(h)],  # NuScenes results.json expects [w, l, h]
+                rotation=[
+                    float(quat[0]),
+                    float(quat[1]),
+                    float(quat[2]),
+                    float(quat[3]),
+                ],
+                velocity=trans_vel,
+                detection_name=cls_name,
                 detection_score=float(scores[i]),
-                attribute_name=''
+                attribute_name=attr_name,
             )
             nusc_annos.append(nusc_anno)
         return nusc_annos

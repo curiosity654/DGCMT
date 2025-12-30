@@ -158,56 +158,105 @@ class LoadMultiViewImageFromTri3D:
 class LoadAnnotationsFromTri3D:
     def __init__(self):
         self.undo_tri3d_rot = Rotation.from_euler("Z", -np.pi / 2)
+        # nuScenes official attributes mapping
+        self.attr_table = [
+            "cycle.with_rider",
+            "cycle.without_rider",
+            "pedestrian.moving",
+            "pedestrian.standing",
+            "pedestrian.sitting_lying_down",
+            "vehicle.moving",
+            "vehicle.parked",
+            "vehicle.stopped",
+        ]
 
     def __call__(self, results):
-        dataset = results['tri3d_dataset']
-        seq, frame, sensor = int(results['seq']), int(results['frame']), results['primary_sensor']
-        cat_mapping, classes = results.get('cat_mapping', {}), results.get('CLASSES', [])
-        
+        dataset = results["tri3d_dataset"]
+        seq, frame, sensor = (
+            int(results["seq"]),
+            int(results["frame"]),
+            results["primary_sensor"],
+        )
+        cat_mapping, classes = results.get("cat_mapping", {}), results.get("CLASSES", [])
+
         boxes_tri3d = dataset.boxes(seq, frame, coords=sensor)
-        gt_bboxes_3d, gt_labels_3d = [], []
-        
+        gt_bboxes_3d, gt_labels_3d, gt_attributes_3d = [], [], []
+
         # Matrix to undo the lidar rotation for box centers and headings
         undo_mat = self.undo_tri3d_rot.as_matrix()
 
         for box in boxes_tri3d:
             # 1. UNDO Lidar rotation for center and heading
             center_native = undo_mat[:3, :3] @ box.center
-            
-            # NuScenes native heading: 
-            # In Tri3D, 0 is along X-axis. 
+
+            # NuScenes native heading:
+            # In Tri3D, 0 is along X-axis.
             # After -90 deg rotation, Tri3D's X becomes native Y.
             # In native NuScenes, heading 0 is along X-axis, pi/2 is along Y-axis.
             # So Tri3D heading 0 should become native heading pi/2.
             heading_native = box.heading + np.pi / 2
-            
-            # 2. Dimensions: 
+
+            # 2. Dimensions:
             # Tri3D size is [Length, Width, Height]
             l_tri3d, w_tri3d, h_tri3d = box.size
-            
+
             # In LiDARInstance3DBoxes for NuScenes, the order is [x, y, z, l, w, h, yaw]
             # After rotation, Tri3D's "Length" is still the dimension along the heading.
             l, w, h = l_tri3d, w_tri3d, h_tri3d
-            
+
+            # 3. Velocity:
+            # box.velocity is in Tri3D LiDAR frame, rotate to Native LiDAR frame
+            if hasattr(box, "velocity"):
+                vel_native = undo_mat[:3, :3] @ box.velocity
+                vx, vy = vel_native[0], vel_native[1]
+            else:
+                vx, vy = 0.0, 0.0
+
             raw_label = box.label
             mapped_label = None
             for k, v in cat_mapping.items():
                 if raw_label.startswith(k):
-                    mapped_label = v; break
-            
+                    mapped_label = v
+                    break
+
             if mapped_label and mapped_label in classes:
-                 gt_labels_3d.append(classes.index(mapped_label))
-                 # [x, y, z, l, w, h, yaw, vx, vy]
-                 gt_bboxes_3d.append([center_native[0], center_native[1], center_native[2], 
-                                      l, w, h, heading_native, 0.0, 0.0])
-        
+                gt_labels_3d.append(classes.index(mapped_label))
+                # [x, y, z, l, w, h, yaw, vx, vy]
+                gt_bboxes_3d.append(
+                    [
+                        center_native[0],
+                        center_native[1],
+                        center_native[2],
+                        l,
+                        w,
+                        h,
+                        heading_native,
+                        vx,
+                        vy,
+                    ]
+                )
+
+                # 4. Attributes:
+                attr_idx = 0  # Default to 0 if not found, or use a specific "ignore" value
+                if hasattr(box, "attributes") and box.attributes:
+                    for attr_name in box.attributes:
+                        if attr_name in self.attr_table:
+                            attr_idx = self.attr_table.index(attr_name)
+                            break
+                gt_attributes_3d.append(attr_idx)
+
         if gt_bboxes_3d:
             gt_bboxes_3d = np.array(gt_bboxes_3d, dtype=np.float32)
             gt_labels_3d = np.array(gt_labels_3d)
+            gt_attributes_3d = np.array(gt_attributes_3d)
         else:
             gt_bboxes_3d = np.zeros((0, 9), dtype=np.float32)
             gt_labels_3d = np.zeros((0,), dtype=int)
+            gt_attributes_3d = np.zeros((0,), dtype=int)
 
-        results['gt_bboxes_3d'] = LiDARInstance3DBoxes(gt_bboxes_3d, box_dim=9, origin=(0.5, 0.5, 0.5))
-        results['gt_labels_3d'] = gt_labels_3d
+        results["gt_bboxes_3d"] = LiDARInstance3DBoxes(
+            gt_bboxes_3d, box_dim=9, origin=(0.5, 0.5, 0.5)
+        )
+        results["gt_labels_3d"] = gt_labels_3d
+        results["gt_attributes_3d"] = gt_attributes_3d
         return results

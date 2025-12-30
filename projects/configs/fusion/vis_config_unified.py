@@ -70,6 +70,3 @@ data = dict(
         test_mode=False,
         box_type_3d='LiDAR')
 )
-
-
-
