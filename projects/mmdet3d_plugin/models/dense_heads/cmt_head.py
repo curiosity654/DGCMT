@@ -603,6 +603,14 @@ class CmtHead(BaseModule):
             assign_results = self.assigner.assign(bbox_pred, logits_pred, gt_bboxes, gt_labels)
             sampling_result = self.sampler.sample(assign_results, bbox_pred, gt_bboxes)
             pos_inds, neg_inds = sampling_result.pos_inds, sampling_result.neg_inds
+            
+            # Extract IoU information from assign_result
+            if assign_results.max_overlaps is not None:
+                ious = assign_results.max_overlaps
+            else:
+                # HungarianAssigner3D returns None, keep None to indicate no IoU recording
+                ious = None
+            
             # label targets
             labels = gt_bboxes.new_full((num_bboxes, ),
                                     num_classes,
@@ -617,12 +625,12 @@ class CmtHead(BaseModule):
             
             if len(sampling_result.pos_gt_bboxes) > 0:
                 bbox_targets[pos_inds] = sampling_result.pos_gt_bboxes
-            return labels, label_weights, bbox_targets, bbox_weights, pos_inds, neg_inds
+            return labels, label_weights, bbox_targets, bbox_weights, pos_inds, neg_inds, ious
 
-        labels_tasks, labels_weights_tasks, bbox_targets_tasks, bbox_weights_tasks, pos_inds_tasks, neg_inds_tasks\
+        labels_tasks, labels_weights_tasks, bbox_targets_tasks, bbox_weights_tasks, pos_inds_tasks, neg_inds_tasks, ious_tasks\
              = multi_apply(task_assign, pred_bboxes, pred_logits, task_boxes, task_classes, self.num_classes)
         
-        return labels_tasks, labels_weights_tasks, bbox_targets_tasks, bbox_weights_tasks, pos_inds_tasks, neg_inds_tasks
+        return labels_tasks, labels_weights_tasks, bbox_targets_tasks, bbox_weights_tasks, pos_inds_tasks, neg_inds_tasks, ious_tasks
             
     def get_targets(self, gt_bboxes_3d, gt_labels_3d, preds_bboxes, preds_logits):
         """"Compute regression and classification targets for a batch image.
@@ -642,13 +650,13 @@ class CmtHead(BaseModule):
                 - num_total_neg_tasks (list[int]): num_tasks x Number of negative samples.
         """
         (labels_list, labels_weight_list, bbox_targets_list,
-         bbox_weights_list, pos_inds_list, neg_inds_list) = multi_apply(
+         bbox_weights_list, pos_inds_list, neg_inds_list, ious_list) = multi_apply(
             self._get_targets_single, gt_bboxes_3d, gt_labels_3d, preds_bboxes, preds_logits
         )
         task_num = len(labels_list[0])
         num_total_pos_tasks, num_total_neg_tasks = [], []
         task_labels_list, task_labels_weight_list, task_bbox_targets_list, \
-            task_bbox_weights_list = [], [], [], []
+            task_bbox_weights_list, task_ious_list = [], [], [], [], []
 
         for task_id in range(task_num):
             num_total_pos_task = sum((inds[task_id].numel() for inds in pos_inds_list))
@@ -659,9 +667,10 @@ class CmtHead(BaseModule):
             task_labels_weight_list.append([labels_weight_list[batch_idx][task_id] for batch_idx in range(len(gt_bboxes_3d))])
             task_bbox_targets_list.append([bbox_targets_list[batch_idx][task_id] for batch_idx in range(len(gt_bboxes_3d))])
             task_bbox_weights_list.append([bbox_weights_list[batch_idx][task_id] for batch_idx in range(len(gt_bboxes_3d))])
+            task_ious_list.append([ious_list[batch_idx][task_id] for batch_idx in range(len(gt_bboxes_3d))])
         
         return (task_labels_list, task_labels_weight_list, task_bbox_targets_list,
-                task_bbox_weights_list, num_total_pos_tasks, num_total_neg_tasks)
+                task_bbox_weights_list, num_total_pos_tasks, num_total_neg_tasks, task_ious_list)
         
     def _loss_single_task(self,
                           pred_bboxes,
@@ -671,7 +680,8 @@ class CmtHead(BaseModule):
                           bbox_targets_list,
                           bbox_weights_list,
                           num_total_pos,
-                          num_total_neg):
+                          num_total_neg,
+                          ious_list):
         """"Compute loss for single task.
         Outputs from a single decoder layer of a single feature level are used.
         Args:
@@ -683,9 +693,11 @@ class CmtHead(BaseModule):
             bbox_weights_list(list[Tensor]): batch_size x (num_query, 10)
             num_total_pos: int
             num_total_neg: int
+            ious_list (list[Tensor or None]): batch_size x (num_query, ) IoU values or None
         Returns:
             loss_cls
-            loss_bbox 
+            loss_bbox
+            ious (Tensor or None): Concatenated IoU values for the task
         """
         labels = torch.cat(labels_list, dim=0)
         labels_weights = torch.cat(labels_weights_list, dim=0)
@@ -714,7 +726,14 @@ class CmtHead(BaseModule):
 
         loss_cls = torch.nan_to_num(loss_cls)
         loss_bbox = torch.nan_to_num(loss_bbox) 
-        return loss_cls, loss_bbox
+        
+        # Concatenate IoUs from all samples in the batch
+        if ious_list[0] is not None:
+            ious = torch.cat(ious_list, dim=0)
+        else:
+            ious = None
+        
+        return loss_cls, loss_bbox, ious
 
     def loss_single(self,
                     pred_bboxes,
@@ -741,8 +760,8 @@ class CmtHead(BaseModule):
             gt_bboxes_3d, gt_labels_3d, pred_bboxes_list, pred_logits_list
         )
         (labels_list, label_weights_list, bbox_targets_list, bbox_weights_list,
-         num_total_pos, num_total_neg) = cls_reg_targets
-        loss_cls_tasks, loss_bbox_tasks = multi_apply(
+         num_total_pos, num_total_neg, ious_list) = cls_reg_targets
+        loss_cls_tasks, loss_bbox_tasks, ious_tasks = multi_apply(
             self._loss_single_task, 
             pred_bboxes,
             pred_logits,
@@ -751,10 +770,11 @@ class CmtHead(BaseModule):
             bbox_targets_list,
             bbox_weights_list,
             num_total_pos,
-            num_total_neg
+            num_total_neg,
+            ious_list
         )
 
-        return sum(loss_cls_tasks), sum(loss_bbox_tasks)
+        return sum(loss_cls_tasks), sum(loss_bbox_tasks), ious_tasks
     
     def _dn_loss_single_task(self,
                              pred_bboxes,
@@ -854,7 +874,7 @@ class CmtHead(BaseModule):
         all_pred_bboxes = [all_pred_bboxes[idx] for idx in range(num_decoder)]
         all_pred_logits = [all_pred_logits[idx] for idx in range(num_decoder)]
 
-        loss_cls, loss_bbox = multi_apply(
+        loss_cls, loss_bbox, ious_list_per_layer = multi_apply(
             self.loss_single, all_pred_bboxes, all_pred_logits,
             [gt_bboxes_3d for _ in range(num_decoder)],
             [gt_labels_3d for _ in range(num_decoder)], 
@@ -870,6 +890,30 @@ class CmtHead(BaseModule):
             loss_dict[f'd{num_dec_layer}.loss_cls'] = loss_cls_i
             loss_dict[f'd{num_dec_layer}.loss_bbox'] = loss_bbox_i
             num_dec_layer += 1
+        
+        # Record matched IoUs from assigner results
+        ious_last_layer = ious_list_per_layer[-1]
+        matched_ious = []
+        
+        # Check if any samples contain valid IoU information
+        has_valid_ious = False
+        for task_ious in ious_last_layer:
+            if task_ious is not None:
+                has_valid_ious = True
+                # Get IoU of positive samples (IoU > 0 indicates matched positive samples)
+                pos_mask = task_ious > 0
+                if pos_mask.sum() > 0:
+                    pos_ious = task_ious[pos_mask]
+                    matched_ious.extend(pos_ious.detach().cpu().numpy().tolist())
+        
+        # Only record to loss_dict when valid IoU information exists
+        if has_valid_ious and matched_ious:
+            # Calculate average IoU
+            avg_iou = sum(matched_ious) / len(matched_ious)
+            loss_dict['matched_ious'] = loss_cls[-1].new_tensor(avg_iou)
+        # If no valid IoU information (e.g., using HungarianAssigner3D), don't record matched_ious
+        else:
+            loss_dict['matched_ious'] = loss_cls[-1].new_tensor(0.0)
         
         dn_pred_bboxes, dn_pred_logits = collections.defaultdict(list), collections.defaultdict(list)
         dn_mask_dicts = collections.defaultdict(list)

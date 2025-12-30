@@ -8,7 +8,7 @@ class_names = [
 ]
 voxel_size = [0.075, 0.075, 0.2]
 out_size_factor = 8
-evaluation = dict(interval=20)
+evaluation = dict(interval=4)
 dataset_type = 'UnifiedMMDet3DDataset'
 data_root = 'data/nuscenes/'
 input_modality = dict(
@@ -311,11 +311,12 @@ model = dict(
         pts=dict(
             dataset='nuScenes',
             assigner=dict(
-                type='HungarianAssigner3D',
+                type='HungarianAssigner3DV3',
                 # cls_cost=dict(type='ClassificationCost', weight=2.0),
                 cls_cost=dict(type='FocalLossCost', weight=2.0),
                 reg_cost=dict(type='BBox3DL1Cost', weight=0.25),
-                iou_cost=dict(type='IoUCost', weight=0.0), # Fake cost. This is just to make it compatible with DETR head. 
+                iou_cost=dict(type='IoU3DCost', weight=0.0), # Fake cost. This is just to make it compatible with DETR head. 
+                iou_calculator=dict(type='BboxOverlaps3D', coordinate='lidar'),
                 pc_range=point_cloud_range,
                 code_weights=[2.0, 2.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.2, 0.2],
             ),
@@ -368,7 +369,8 @@ checkpoint_config = dict(interval=1)
 log_config = dict(
     interval=50,
     hooks=[dict(type='TextLoggerHook'),
-           dict(type='TensorboardLoggerHook')])
+           dict(type='TensorboardLoggerHook'),
+           dict(type='WandbLoggerHook',init_kwargs=dict(project='DGFusion', name='cmt_voxel0075_vov_1600x640_cbgs-wo_gtsample-unified_dataset',))])
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
 work_dir = None
