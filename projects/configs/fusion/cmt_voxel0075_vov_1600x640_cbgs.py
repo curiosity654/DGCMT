@@ -8,7 +8,7 @@ class_names = [
 ]
 voxel_size = [0.075, 0.075, 0.2]
 out_size_factor = 8
-evaluation = dict(interval=20)
+evaluation = dict(interval=4)
 dataset_type = 'CustomNuScenesDataset'
 data_root = 'data/nuscenes/'
 input_modality = dict(
@@ -51,7 +51,7 @@ train_pipeline = [
         mixup_rate=0.5,
         db_sampler=dict(
             type='UnifiedDataBaseSampler',
-            data_root=None,
+            data_root=data_root,
             info_path=data_root + 'nuscenes_dbinfos_train.pkl',
             rate=1.0,
             prepare=dict(
@@ -150,7 +150,7 @@ test_pipeline = [
         ])
 ]
 data = dict(
-    samples_per_gpu=2,
+    samples_per_gpu=4,
     workers_per_gpu=6,
     train=dict(
         type='CBGSDataset',
@@ -188,7 +188,7 @@ model = dict(
     type='CmtDetector',
     use_grid_mask=True,
     img_backbone=dict(
-        type='VoVNet',
+        type='VoVNetCP',
         spec_name='V-99-eSE',
         norm_eval=True,
         frozen_stages=-1,
@@ -299,11 +299,12 @@ model = dict(
         pts=dict(
             dataset='nuScenes',
             assigner=dict(
-                type='HungarianAssigner3D',
+                type='HungarianAssigner3DV3',
                 # cls_cost=dict(type='ClassificationCost', weight=2.0),
                 cls_cost=dict(type='FocalLossCost', weight=2.0),
                 reg_cost=dict(type='BBox3DL1Cost', weight=0.25),
-                iou_cost=dict(type='IoUCost', weight=0.0), # Fake cost. This is just to make it compatible with DETR head. 
+                iou_cost=dict(type='IoU3DCost', weight=0.0), # Fake cost. This is just to make it compatible with DETR head. 
+                iou_calculator=dict(type='BboxOverlaps3D', coordinate='lidar'),
                 pc_range=point_cloud_range,
                 code_weights=[2.0, 2.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.2, 0.2],
             ),
@@ -356,11 +357,12 @@ checkpoint_config = dict(interval=1)
 log_config = dict(
     interval=50,
     hooks=[dict(type='TextLoggerHook'),
-           dict(type='TensorboardLoggerHook')])
+           dict(type='TensorboardLoggerHook'),
+           dict(type='WandbLoggerHook',init_kwargs=dict(project='DGFusion', name='cmt_voxel0075_vov_1600x640_cbgs',))])
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
 work_dir = None
-load_from='ckpts/fcos3d_vovnet_imgbackbone-remapped.pth'
+load_from='checkpoints/fcos3d_vovnet_imgbackbone-remapped.pth'
 resume_from = None
 workflow = [('train', 1)]
 gpu_ids = range(0, 8)

@@ -152,8 +152,8 @@ test_pipeline = [
         ])
 ]
 data = dict(
-    samples_per_gpu=2,
-    workers_per_gpu=6,
+    samples_per_gpu=4,
+    workers_per_gpu=4,
     train=dict(
         type='CBGSDataset',
         dataset=dict(
@@ -200,7 +200,7 @@ model = dict(
     type='CmtDetector',
     use_grid_mask=True,
     img_backbone=dict(
-        type='VoVNet',
+        type='VoVNetCP',
         spec_name='V-99-eSE',
         norm_eval=True,
         frozen_stages=-1,
