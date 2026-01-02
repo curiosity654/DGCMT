@@ -7,13 +7,33 @@ from tri3d.geometry import as_matrix, Pipeline, Rotation
 
 @PIPELINES.register_module()
 class LoadPointsFromTri3D:
-    def __init__(self, coord_type='LIDAR', load_dim=5, use_dim=[0, 1, 2, 3, 4], sweeps_num=0):
+    """Load points from Tri3D dataset.
+    
+    Args:
+        coord_type (str): Type of coordinate system. Default: 'LIDAR'.
+        load_dim (int): Dimension of loaded points. Default: 5.
+        use_dim (list[int]): Dimensions to use. Default: [0, 1, 2, 3, 4].
+        sweeps_num (int): Number of sweeps to load. Default: 0.
+        undo_z_rotation (bool): Whether to undo the Z-90 rotation that Tri3D
+            applies to NuScenes. Set to True for NuScenes, False for Argoverse2.
+            Default: True.
+        timestamp_unit (float): Unit to convert timestamp difference. 
+            1e6 for NuScenes (microseconds), 1e9 for Argoverse2 (nanoseconds).
+            Default: 1e6.
+    """
+    def __init__(self, coord_type='LIDAR', load_dim=5, use_dim=[0, 1, 2, 3, 4], 
+                 sweeps_num=0, undo_z_rotation=True, timestamp_unit=1e6):
         self.coord_type = coord_type
         self.load_dim = load_dim
         self.use_dim = use_dim
         self.sweeps_num = sweeps_num
+        self.undo_z_rotation = undo_z_rotation
+        self.timestamp_unit = timestamp_unit
         # Inverse of the Z-90 rotation that Tri3D applies to NuScenes
-        self.undo_tri3d_rot = Rotation.from_euler("Z", -np.pi / 2)
+        if undo_z_rotation:
+            self.undo_tri3d_rot = Rotation.from_euler("Z", -np.pi / 2)
+        else:
+            self.undo_tri3d_rot = None
 
     def __call__(self, results):
         dataset = results['tri3d_dataset']
@@ -26,7 +46,8 @@ class LoadPointsFromTri3D:
         def get_rotated_points(f_idx):
             pts = dataset.points(seq, f_idx, sensor)
             # UNDO Tri3D's internal 90-deg rotation to return to native NuScenes coords
-            pts[:, :3] = self.undo_tri3d_rot.apply(pts[:, :3])
+            if self.undo_tri3d_rot is not None:
+                pts[:, :3] = self.undo_tri3d_rot.apply(pts[:, :3])
             return pts
 
         points = get_rotated_points(frame)
@@ -47,7 +68,7 @@ class LoadPointsFromTri3D:
                 if sweep_idx < 0: break
                 
                 sweep_ts = all_timestamps[sweep_idx]
-                time_lag = (current_ts - sweep_ts) / 1e6 # NuScenes timestamps are in microseconds
+                time_lag = (current_ts - sweep_ts) / self.timestamp_unit
                 
                 try:
                     # alignment in Tri3D is coordinate-system aware. 
@@ -56,8 +77,11 @@ class LoadPointsFromTri3D:
                     # Goal: native_frame_pts = R_inv @ transform @ tri3d_sweep_pts
                     transform = dataset.alignment(seq, (sweep_idx, frame), (sensor, sensor))
                     
-                    # R_inv is self.undo_tri3d_rot
-                    combined_mat = as_matrix(self.undo_tri3d_rot) @ as_matrix(transform)
+                    # R_inv is self.undo_tri3d_rot (if enabled)
+                    if self.undo_tri3d_rot is not None:
+                        combined_mat = as_matrix(self.undo_tri3d_rot) @ as_matrix(transform)
+                    else:
+                        combined_mat = as_matrix(transform)
                     
                     sweep_pts = dataset.points(seq, sweep_idx, sensor)
                     sweep_pts_xyz = sweep_pts[:, :3]
@@ -87,8 +111,19 @@ class LoadPointsFromTri3D:
 
 @PIPELINES.register_module()
 class LoadMultiViewImageFromTri3D:
-    def __init__(self):
-        self.undo_tri3d_rot = Rotation.from_euler("Z", -np.pi / 2)
+    """Load multi-view images from Tri3D dataset.
+    
+    Args:
+        undo_z_rotation (bool): Whether to undo the Z-90 rotation that Tri3D
+            applies to NuScenes. Set to True for NuScenes, False for Argoverse2.
+            Default: True.
+    """
+    def __init__(self, undo_z_rotation=True):
+        self.undo_z_rotation = undo_z_rotation
+        if undo_z_rotation:
+            self.undo_tri3d_rot = Rotation.from_euler("Z", -np.pi / 2)
+        else:
+            self.undo_tri3d_rot = None
 
     def __call__(self, results):
         dataset = results['tri3d_dataset']
@@ -117,13 +152,18 @@ class LoadMultiViewImageFromTri3D:
                         break
 
             try:
-                # IMPORTANT: UNDO the LIDAR rotation for lidar2cam and lidar2img
-                # Tri3D: l2c = Cam_pose.inv() @ Lidar_pose_tri3d
-                # We want: l2c_native = Cam_pose.inv() @ Lidar_pose_native
-                # Lidar_pose_tri3d = Lidar_pose_native @ R
-                # So: l2c_native = l2c @ R
+                # Compute lidar to camera transformation
                 l2c_transform = dataset.alignment(seq, (lidar_frame, cam_frame), (lidar_sensor, cam_sensor))
-                lidar2cam = as_matrix(l2c_transform) @ np.linalg.inv(self.undo_tri3d_rot.as_matrix())
+                
+                if self.undo_tri3d_rot is not None:
+                    # IMPORTANT: UNDO the LIDAR rotation for lidar2cam and lidar2img
+                    # Tri3D: l2c = Cam_pose.inv() @ Lidar_pose_tri3d
+                    # We want: l2c_native = Cam_pose.inv() @ Lidar_pose_native
+                    # Lidar_pose_tri3d = Lidar_pose_native @ R
+                    # So: l2c_native = l2c @ R^(-1)
+                    lidar2cam = as_matrix(l2c_transform) @ np.linalg.inv(self.undo_tri3d_rot.as_matrix())
+                else:
+                    lidar2cam = as_matrix(l2c_transform)
                     
                 c2i_transform = dataset.alignment(seq, cam_frame, (cam_sensor, img_plane_sensor))
                 cam_intrinsic = np.eye(4)
@@ -156,8 +196,19 @@ class LoadMultiViewImageFromTri3D:
 
 @PIPELINES.register_module()
 class LoadAnnotationsFromTri3D:
-    def __init__(self):
-        self.undo_tri3d_rot = Rotation.from_euler("Z", -np.pi / 2)
+    """Load annotations from Tri3D dataset.
+    
+    Args:
+        undo_z_rotation (bool): Whether to undo the Z-90 rotation that Tri3D
+            applies to NuScenes. Set to True for NuScenes, False for Argoverse2.
+            Default: True.
+    """
+    def __init__(self, undo_z_rotation=True):
+        self.undo_z_rotation = undo_z_rotation
+        if undo_z_rotation:
+            self.undo_tri3d_rot = Rotation.from_euler("Z", -np.pi / 2)
+        else:
+            self.undo_tri3d_rot = None
         # nuScenes official attributes mapping
         self.attr_table = [
             "cycle.with_rider",
@@ -182,33 +233,44 @@ class LoadAnnotationsFromTri3D:
         boxes_tri3d = dataset.boxes(seq, frame, coords=sensor)
         gt_bboxes_3d, gt_labels_3d, gt_attributes_3d = [], [], []
 
-        # Matrix to undo the lidar rotation for box centers and headings
-        undo_mat = self.undo_tri3d_rot.as_matrix()
+        # Matrix to undo the lidar rotation for box centers and headings (if enabled)
+        if self.undo_tri3d_rot is not None:
+            undo_mat = self.undo_tri3d_rot.as_matrix()
+        else:
+            undo_mat = None
 
         for box in boxes_tri3d:
-            # 1. UNDO Lidar rotation for center and heading
-            center_native = undo_mat[:3, :3] @ box.center
-
-            # NuScenes native heading:
-            # In Tri3D, 0 is along X-axis.
-            # After -90 deg rotation, Tri3D's X becomes native Y.
-            # In native NuScenes, heading 0 is along X-axis, pi/2 is along Y-axis.
-            # So Tri3D heading 0 should become native heading pi/2.
-            heading_native = box.heading + np.pi / 2
+            # 1. Transform center and heading based on rotation mode
+            if undo_mat is not None:
+                # NuScenes: UNDO Lidar rotation for center and heading
+                center = undo_mat[:3, :3] @ box.center
+                # NuScenes native heading:
+                # In Tri3D, 0 is along X-axis.
+                # After -90 deg rotation, Tri3D's X becomes native Y.
+                # In native NuScenes, heading 0 is along X-axis, pi/2 is along Y-axis.
+                # So Tri3D heading 0 should become native heading pi/2.
+                heading = box.heading + np.pi / 2
+            else:
+                # Argoverse2: Use Tri3D coordinates directly (already aligned)
+                center = box.center
+                heading = box.heading
 
             # 2. Dimensions:
             # Tri3D size is [Length, Width, Height]
             l_tri3d, w_tri3d, h_tri3d = box.size
 
-            # In LiDARInstance3DBoxes for NuScenes, the order is [x, y, z, l, w, h, yaw]
-            # After rotation, Tri3D's "Length" is still the dimension along the heading.
+            # In LiDARInstance3DBoxes, the order is [x, y, z, l, w, h, yaw]
             l, w, h = l_tri3d, w_tri3d, h_tri3d
 
             # 3. Velocity:
-            # box.velocity is in Tri3D LiDAR frame, rotate to Native LiDAR frame
             if hasattr(box, "velocity"):
-                vel_native = undo_mat[:3, :3] @ box.velocity
-                vx, vy = vel_native[0], vel_native[1]
+                if undo_mat is not None:
+                    # NuScenes: rotate velocity to Native LiDAR frame
+                    vel = undo_mat[:3, :3] @ box.velocity
+                    vx, vy = vel[0], vel[1]
+                else:
+                    # Argoverse2: use velocity directly
+                    vx, vy = box.velocity[0], box.velocity[1]
             else:
                 vx, vy = 0.0, 0.0
 
@@ -224,13 +286,13 @@ class LoadAnnotationsFromTri3D:
                 # [x, y, z, l, w, h, yaw, vx, vy]
                 gt_bboxes_3d.append(
                     [
-                        center_native[0],
-                        center_native[1],
-                        center_native[2],
+                        center[0],
+                        center[1],
+                        center[2],
                         l,
                         w,
                         h,
-                        heading_native,
+                        heading,
                         vx,
                         vy,
                     ]

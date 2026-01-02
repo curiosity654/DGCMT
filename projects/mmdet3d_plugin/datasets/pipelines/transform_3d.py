@@ -36,16 +36,27 @@ class PadMultiViewImage(object):
         self.pad_val = pad_val
         # only one of size and size_divisor should be valid
         assert size is not None or size_divisor is not None
-        assert size is None or size_divisor is None
+        if size != 'same2max':
+            assert size is None or size_divisor is None
 
     def _pad_img(self, results):
         """Pad images according to ``self.size``."""
-        if self.size is not None:
+        if self.size == 'same2max':
+            max_h = max([img.shape[0] for img in results['img']])
+            max_w = max([img.shape[1] for img in results['img']])
+            max_shape = (max_h, max_w)
+            padded_img = [mmcv.impad(img, shape=max_shape, pad_val=self.pad_val) for img in results['img']]
+        elif self.size is not None:
             padded_img = [mmcv.impad(
                 img, shape=self.size, pad_val=self.pad_val) for img in results['img']]
         elif self.size_divisor is not None:
             padded_img = [mmcv.impad_to_multiple(
                 img, self.size_divisor, pad_val=self.pad_val) for img in results['img']]
+        
+        if self.size_divisor is not None and self.size == 'same2max':
+            padded_img = [mmcv.impad_to_multiple(
+                img, self.size_divisor, pad_val=self.pad_val) for img in padded_img]
+
         results['img'] = padded_img
         results['img_shape'] = [img.shape for img in padded_img]
         results['pad_shape'] = [img.shape for img in padded_img]
@@ -67,6 +78,86 @@ class PadMultiViewImage(object):
         repr_str += f'(size={self.size}, '
         repr_str += f'size_divisor={self.size_divisor}, '
         repr_str += f'pad_val={self.pad_val})'
+        return repr_str
+
+
+@PIPELINES.register_module()
+class ResizeMultiViewImage(object):
+    """Resize multi-view images with uniform scaling.
+    This transform resizes all images to the same target size and updates
+    camera intrinsics accordingly. Useful for reducing resolution to speed up inference.
+    
+    Args:
+        size (tuple): Target size (height, width).
+        scale (float, optional): Scale factor. If provided, size is ignored.
+        keep_ratio (bool): If True, resize longest side to match target while keeping aspect ratio.
+                          Then pad to square. Default: False.
+    """
+
+    def __init__(self, size=None, scale=None, keep_ratio=False):
+        assert size is not None or scale is not None, "Either size or scale must be provided"
+        self.size = size
+        self.scale = scale
+        self.keep_ratio = keep_ratio
+
+    def __call__(self, results):
+        """Call function to resize images.
+        Args:
+            results (dict): Result dict from loading pipeline.
+        Returns:
+            dict: Resized results with updated camera intrinsics.
+        """
+        imgs = results['img']
+        N = len(imgs)
+        new_imgs = []
+        
+        for i in range(N):
+            img = imgs[i]
+            h, w = img.shape[:2]
+            
+            # Calculate target size
+            if self.scale is not None:
+                new_h = int(h * self.scale)
+                new_w = int(w * self.scale)
+                scale_h = self.scale
+                scale_w = self.scale
+            elif self.keep_ratio:
+                # Resize longest side to target size, keep aspect ratio
+                target_size = max(self.size)  # Use max dimension as target
+                scale = target_size / max(h, w)
+                new_h = int(h * scale)
+                new_w = int(w * scale)
+                scale_h = scale
+                scale_w = scale
+            else:
+                new_h, new_w = self.size
+                scale_h = new_h / h
+                scale_w = new_w / w
+            
+            # Resize image
+            resized_img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+            new_imgs.append(resized_img)
+            
+            # Update camera intrinsics if available
+            if 'cam_intrinsic' in results:
+                # Scale the intrinsic matrix
+                results['cam_intrinsic'][i][0, :] *= scale_w  # fx, cx
+                results['cam_intrinsic'][i][1, :] *= scale_h  # fy, cy
+        
+        results['img'] = new_imgs
+        results['img_shape'] = [img.shape for img in new_imgs]
+        results['pad_shape'] = [img.shape for img in new_imgs]
+        
+        # Update lidar2img if available
+        if 'lidar2img' in results:
+            results['lidar2img'] = [results['cam_intrinsic'][i] @ results['lidar2cam'][i] 
+                                    for i in range(len(results['lidar2cam']))]
+        
+        return results
+
+    def __repr__(self):
+        repr_str = self.__class__.__name__
+        repr_str += f'(size={self.size}, scale={self.scale}, keep_ratio={self.keep_ratio})'
         return repr_str
 
 
@@ -338,15 +429,48 @@ class ResizeCropFlipImage(object):
         N = len(imgs)
         new_imgs = []
         new_depths = []
-        resize, resize_dims, crop, flip, rotate = self._sample_augmentation()
+        
+        fH, fW = self.data_aug_conf["final_dim"]
+        if self.training:
+            global_resize = np.random.uniform(*self.data_aug_conf["resize_lim"])
+            global_flip = self.data_aug_conf["rand_flip"] and np.random.choice([0, 1])
+            global_rotate = np.random.uniform(*self.data_aug_conf["rot_lim"])
+            global_bot_pct = np.random.uniform(*self.data_aug_conf["bot_pct_lim"])
+        else:
+            global_resize = None
+            global_flip = False
+            global_rotate = 0
+            global_bot_pct = np.mean(self.data_aug_conf["bot_pct_lim"])
+
         for i in range(N):
             post_rot = torch.eye(2)
             post_tran = torch.zeros(2)
             img = imgs[i]
+            H, W = img.shape[:2]
 
             # augmentation (resize, crop, horizontal flip, rotate)
             if self.pic_wise:
                 resize, resize_dims, crop, flip, rotate = self._sample_augmentation()
+            else:
+                if self.training:
+                    resize = global_resize
+                    resize_dims = (int(W * resize), int(H * resize))
+                    newW, newH = resize_dims
+                    crop_h = int((1 - global_bot_pct) * newH) - fH
+                    crop_w = int(np.random.uniform(0, max(0, newW - fW)))
+                    crop = (crop_w, crop_h, crop_w + fW, crop_h + fH)
+                    flip = global_flip
+                    rotate = global_rotate
+                else:
+                    resize = max(fH / H, fW / W)
+                    resize_dims = (int(W * resize), int(H * resize))
+                    newW, newH = resize_dims
+                    crop_h = int((1 - global_bot_pct) * newH) - fH
+                    crop_w = int(max(0, newW - fW) / 2)
+                    crop = (crop_w, crop_h, crop_w + fW, crop_h + fH)
+                    flip = False
+                    rotate = 0
+
             img, post_rot2, post_tran2 = self._img_transform(
                 img,
                 post_rot,
@@ -375,6 +499,8 @@ class ResizeCropFlipImage(object):
 
         results["img"] = new_imgs
         results["depths"] = new_depths
+        results['img_shape'] = [img.shape for img in new_imgs]
+        results['pad_shape'] = [img.shape for img in new_imgs]
         results['lidar2img'] = [results['cam_intrinsic'][i] @ results['lidar2cam'][i] for i in range(len(results['lidar2cam']))]
 
         return results

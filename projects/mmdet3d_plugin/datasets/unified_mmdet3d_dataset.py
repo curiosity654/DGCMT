@@ -2,6 +2,9 @@ import numpy as np
 import mmcv
 import os.path as osp
 import tempfile
+import torch
+import pandas as pd
+from pathlib import Path
 from mmdet.datasets import DATASETS
 from mmdet3d.datasets import Custom3DDataset
 from mmdet3d.core.bbox import get_box_type
@@ -9,6 +12,7 @@ from mmdet3d.datasets.pipelines import Compose
 import tri3d.datasets as tri3d_datasets
 from pyquaternion import Quaternion
 from tri3d.geometry import RigidTransform, Rotation
+from tqdm import tqdm
 
 class Tri3DObjectWrapper:
     """A wrapper to prevent deepcopy of the large Tri3D dataset object.
@@ -52,6 +56,47 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
         'movable_object.trafficcone': 'traffic_cone',
     }
 
+    # Argoverse2 to NuScenes 10-class mapping (for training/inference)
+    ARGO2_MAPPING = {
+        'REGULAR_VEHICLE': 'car',
+        'LARGE_VEHICLE': 'truck',
+        'BOX_TRUCK': 'truck',
+        'TRUCK': 'truck',
+        'TRUCK_CAB': 'truck',
+        'ARTICULATED_BUS': 'bus',
+        'BUS': 'bus',
+        'SCHOOL_BUS': 'bus',
+        'VEHICULAR_TRAILER': 'trailer',
+        'CONSTRUCTION_BARREL': 'barrier',
+        'MOTORCYCLE': 'motorcycle',
+        'MOTORCYCLIST': 'motorcycle',
+        'BICYCLE': 'bicycle',
+        'BICYCLIST': 'bicycle',
+        'WHEELED_RIDER': 'bicycle',
+        'PEDESTRIAN': 'pedestrian',
+        'OFFICIAL_SIGNALER': 'pedestrian',
+        'CONSTRUCTION_CONE': 'traffic_cone',
+        'BOLLARD': 'barrier',
+        # Ignored categories (not in NuScenes 10 classes):
+        # 'ANIMAL', 'DOG', 'STROLLER', 'WHEELCHAIR', 'WHEELED_DEVICE',
+        # 'SIGN', 'STOP_SIGN', 'MESSAGE_BOARD_TRAILER', 'TRAFFIC_LIGHT_TRAILER',
+        # 'MOBILE_PEDESTRIAN_CROSSING_SIGN', 'RAILED_VEHICLE'
+    }
+
+    # NuScenes 10-class to Argoverse2 mapping (for evaluation)
+    NUSC_TO_AV2_MAPPING = {
+        'car': 'REGULAR_VEHICLE',
+        'truck': 'TRUCK',
+        'construction_vehicle': 'LARGE_VEHICLE',
+        'bus': 'BUS',
+        'trailer': 'VEHICULAR_TRAILER',
+        'barrier': 'BOLLARD',
+        'motorcycle': 'MOTORCYCLE',
+        'bicycle': 'BICYCLE',
+        'pedestrian': 'PEDESTRIAN',
+        'traffic_cone': 'CONSTRUCTION_CONE',
+    }
+
     # nuScenes official attributes mapping
     ATTR_TABLE = [
         "cycle.with_rider",
@@ -93,6 +138,7 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
                  cat_mapping=None,
                  **kwargs):
         # 1. Initialize Tri3D dataset
+        self.dataset_type_name = dataset_type  # Save for branching in evaluate/format
         self.tri3d_cls = getattr(tri3d_datasets, dataset_type)
         
         tri3d_kwargs = {}
@@ -105,11 +151,13 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
         tri3d_dataset = self.tri3d_cls(data_root, **tri3d_kwargs)
         self.tri3d_dataset = Tri3DObjectWrapper(tri3d_dataset)
         
-        # Initialize category mapping
+        # Initialize category mapping based on dataset type
         if cat_mapping is not None:
             self.cat_mapping = cat_mapping
         elif dataset_type == 'NuScenes':
             self.cat_mapping = self.NUSC_MAPPING
+        elif dataset_type == 'Argoverse2':
+            self.cat_mapping = self.ARGO2_MAPPING
         else:
             self.cat_mapping = {}
 
@@ -158,7 +206,7 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
 
         print(f"Indexing {len(sequences)} sequences from {self.tri3d_dataset.__class__.__name__}...")
         
-        for seq in sequences:
+        for seq in tqdm(sequences, desc="Indexing sequences"):
             try:
                 frames = self.tri3d_dataset.keyframes(seq, sensor)
                 is_keyframes = True
@@ -167,41 +215,50 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
                 is_keyframes = False
                 
             for i, frame in enumerate(frames):
-                # Pre-calculate category IDs for CBGS and filtering
-                boxes = self.tri3d_dataset.boxes(seq, frame, coords=sensor)
                 cat_ids = []
-                for box in boxes:
-                    mapped_label = self._map_label(box.label)
-                    if mapped_label and mapped_label in self.CLASSES:
-                        cat_ids.append(self.CLASSES.index(mapped_label))
                 
-                # In training mode, we might want to skip empty frames
-                if not self.test_mode and self.filter_empty_gt and len(cat_ids) == 0:
-                    continue
+                # Only compute cat_ids for training (used by CBGS and empty frame filtering)
+                if not self.test_mode:
+                    boxes = self.tri3d_dataset.boxes(seq, frame, coords=sensor)
+                    for box in boxes:
+                        mapped_label = self._map_label(box.label)
+                        if mapped_label and mapped_label in self.CLASSES:
+                            cat_ids.append(self.CLASSES.index(mapped_label))
+                    
+                    # Skip empty frames in training
+                    if self.filter_empty_gt and len(cat_ids) == 0:
+                        continue
 
-                # Get token for NuScenes evaluation if available
-                token = None
-                if hasattr(self.tri3d_dataset.obj, 'scenes'):
-                    try:
-                        # In Tri3D, NuScenes.sample_tokens(seq) returns tokens for keyframes.
-                        # If we are iterating over keyframes, the index i corresponds to the sample token.
-                        if is_keyframes:
-                            token = self.tri3d_dataset.obj.scenes[seq].sample_tokens[i]
-                        else:
-                            # For non-keyframes, we'd need to find the nearest keyframe token
-                            # or leave it as None. NuScenes evaluation only works on keyframes.
-                            pass
-                    except (AttributeError, IndexError):
-                        pass
-
-                data_infos.append(dict(
-                    token=token,
+                # Build data_info dict with dataset-specific fields
+                data_info = dict(
                     seq=seq,
                     frame=frame,
                     sensor=sensor,
                     sample_idx=f"{seq}_{frame}",
                     cat_ids=list(set(cat_ids))
-                ))
+                )
+
+                # NuScenes-specific: Get sample token for evaluation
+                if self.dataset_type_name == 'NuScenes':
+                    token = None
+                    if hasattr(self.tri3d_dataset.obj, 'scenes'):
+                        try:
+                            if is_keyframes:
+                                token = self.tri3d_dataset.obj.scenes[seq].sample_tokens[i]
+                        except (AttributeError, IndexError):
+                            pass
+                    data_info['token'] = token
+
+                # Argoverse2-specific: Get log_id and timestamp_ns for evaluation
+                elif self.dataset_type_name == 'Argoverse2':
+                    # log_id is the sequence directory name
+                    log_id = self.tri3d_dataset.records[seq].name
+                    # timestamp_ns from tri3d timeline
+                    timestamp_ns = int(self.tri3d_dataset.timestamps(seq, sensor)[frame])
+                    data_info['log_id'] = log_id
+                    data_info['timestamp_ns'] = timestamp_ns
+
+                data_infos.append(data_info)
         
         print(f"Loaded {len(data_infos)} frames (filtered: {self.filter_empty_gt})")
         return data_infos
@@ -343,9 +400,16 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
         return nusc_annos
 
     def format_results(self, outputs, jsonfile_prefix=None):
-        """Format the results to json."""
+        """Format the results based on dataset type."""
+        if self.dataset_type_name == 'Argoverse2':
+            return self._format_results_av2(outputs, jsonfile_prefix)
+        else:
+            return self._format_results_nusc(outputs, jsonfile_prefix)
+
+    def _format_results_nusc(self, outputs, jsonfile_prefix=None):
+        """Format the results to NuScenes json format."""
         nusc_annos = {}
-        print(f"Formatting {len(outputs)} results...")
+        print(f"Formatting {len(outputs)} results for NuScenes...")
         
         for i, out in enumerate(outputs):
             info = self.data_infos[i]
@@ -371,8 +435,15 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
         return results
 
     def evaluate(self, results, logger=None, jsonfile_prefix=None, **kwargs):
+        """Evaluation based on dataset type."""
+        if self.dataset_type_name == 'Argoverse2':
+            return self._evaluate_av2(results, logger, jsonfile_prefix, **kwargs)
+        else:
+            return self._evaluate_nusc(results, logger, jsonfile_prefix, **kwargs)
+
+    def _evaluate_nusc(self, results, logger=None, jsonfile_prefix=None, **kwargs):
         """Evaluation in NuScenes protocol."""
-        print(f"Evaluating {len(results)} results...")
+        print(f"Evaluating {len(results)} results (NuScenes)...")
         
         if jsonfile_prefix is None:
             tmp_dir = tempfile.TemporaryDirectory()
@@ -470,4 +541,285 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
         if tmp_dir is not None:
             tmp_dir.cleanup()
             
+        return detail
+    # ==================== Argoverse2 Evaluation Methods ====================
+
+    def _yaw_to_quat(self, yaw):
+        """Convert yaw angle to quaternion [w, x, y, z]."""
+        # yaw is rotation about z-axis
+        half_yaw = yaw / 2.0
+        qw = np.cos(half_yaw)
+        qx = 0.0
+        qy = 0.0
+        qz = np.sin(half_yaw)
+        return np.array([qw, qx, qy, qz])
+
+    def _format_bbox_av2(self, results, log_id, timestamp_ns):
+        """Convert predictions to Argoverse2 format for a single frame."""
+        if "pts_bbox" in results:
+            bboxes = results["pts_bbox"]["boxes_3d"]
+            scores = results["pts_bbox"]["scores_3d"]
+            labels = results["pts_bbox"]["labels_3d"]
+        else:
+            bboxes = results["boxes_3d"]
+            scores = results["scores_3d"]
+            labels = results["labels_3d"]
+
+        # Convert to numpy
+        bboxes_tensor = bboxes.tensor.cpu().numpy()
+        scores = scores.cpu().numpy()
+        labels = labels.cpu().numpy()
+
+        av2_boxes = []
+        for i in range(len(bboxes_tensor)):
+            # LiDARInstance3DBoxes: [x, y, z, l, w, h, yaw, vx, vy]
+            x, y, z, l, w, h, yaw = bboxes_tensor[i, :7]
+            
+            # Get gravity center (mmdet3d boxes have center at bottom)
+            # For AV2, the center should be at gravity center
+            z_center = z + h / 2.0  # Move from bottom to center
+            
+            # Convert yaw to quaternion
+            quat = self._yaw_to_quat(yaw)
+            
+            # Map NuScenes class to AV2 class
+            cls_name = self.CLASSES[labels[i]]
+            av2_cls = self.NUSC_TO_AV2_MAPPING.get(cls_name, cls_name.upper())
+            
+            av2_boxes.append({
+                'tx_m': x,
+                'ty_m': y,
+                'tz_m': z_center,
+                'length_m': l,
+                'width_m': w,
+                'height_m': h,
+                'qw': quat[0],
+                'qx': quat[1],
+                'qy': quat[2],
+                'qz': quat[3],
+                'score': float(scores[i]),
+                'log_id': log_id,
+                'timestamp_ns': int(timestamp_ns),
+                'category': av2_cls,
+            })
+        
+        return av2_boxes
+
+    def _format_results_av2(self, outputs, jsonfile_prefix=None):
+        """Format the results to Argoverse2 DataFrame format."""
+        print(f"Formatting {len(outputs)} results for Argoverse2...")
+        
+        all_boxes = []
+        for i, out in enumerate(outputs):
+            info = self.data_infos[i]
+            log_id = info.get('log_id')
+            timestamp_ns = info.get('timestamp_ns')
+            
+            if log_id is None or timestamp_ns is None:
+                continue
+            
+            frame_boxes = self._format_bbox_av2(out, log_id, timestamp_ns)
+            all_boxes.extend(frame_boxes)
+        
+        if len(all_boxes) == 0:
+            print("Warning: No boxes to format!")
+            return pd.DataFrame()
+        
+        # Create DataFrame
+        dts = pd.DataFrame(all_boxes)
+        
+        # Sort by score descending
+        dts = dts.sort_values("score", ascending=False)
+        
+        # Save if prefix provided
+        if jsonfile_prefix is not None:
+            feather_path = f"{jsonfile_prefix}_av2_dts.feather"
+            dts.to_feather(feather_path)
+            print(f"Results saved to {feather_path}")
+        
+        # Also save to data_root for persistent cache
+        persistent_path = osp.join(self.data_root, f'{self.tri3d_dataset.split}_dts.feather')
+        dts.to_feather(persistent_path)
+        print(f"Results also saved to {persistent_path}")
+        
+        # Set index for evaluation
+        dts = dts.set_index(["log_id", "timestamp_ns"]).sort_index()
+        
+        return dts
+
+    def _load_av2_annotations(self):
+        """Load Argoverse2 ground truth annotations."""
+        # Try to load cached annotations first
+        anno_path = osp.join(self.data_root, f'{self.tri3d_dataset.split}_anno.feather')
+        
+        if osp.exists(anno_path):
+            print(f"Loading cached annotations from {anno_path}")
+            gts = pd.read_feather(anno_path)
+            return gts.set_index(["log_id", "timestamp_ns"]).sort_index()
+        
+        # Build annotations from tri3d dataset
+        print("Building annotations from Tri3D dataset...")
+        all_gts = []
+        
+        for info in self.data_infos:
+            seq = info['seq']
+            frame = info['frame']
+            sensor = info['sensor']
+            log_id = info.get('log_id')
+            timestamp_ns = info.get('timestamp_ns')
+            
+            if log_id is None or timestamp_ns is None:
+                continue
+            
+            boxes = self.tri3d_dataset.boxes(seq, frame, coords=sensor)
+            
+            for box in boxes:
+                # Map to NuScenes class first, then to AV2
+                mapped_label = self._map_label(box.label)
+                if mapped_label is None:
+                    # Use original AV2 label
+                    av2_cls = box.label
+                else:
+                    av2_cls = self.NUSC_TO_AV2_MAPPING.get(mapped_label, box.label)
+                
+                quat = self._yaw_to_quat(box.heading)
+                z_center = box.center[2]  # Tri3D boxes are already at gravity center
+                
+                # Get num_interior_pts if available
+                num_pts = getattr(box, 'num_interior_pts', 1)
+                
+                all_gts.append({
+                    'tx_m': box.center[0],
+                    'ty_m': box.center[1],
+                    'tz_m': z_center,
+                    'length_m': box.size[0],
+                    'width_m': box.size[1],
+                    'height_m': box.size[2],
+                    'qw': quat[0],
+                    'qx': quat[1],
+                    'qy': quat[2],
+                    'qz': quat[3],
+                    'num_interior_pts': num_pts,
+                    'log_id': log_id,
+                    'timestamp_ns': int(timestamp_ns),
+                    'category': av2_cls,
+                })
+        
+        gts = pd.DataFrame(all_gts)
+        
+        # Cache for future use
+        gts.to_feather(anno_path)
+        print(f"Cached annotations to {anno_path}")
+        
+        return gts.set_index(["log_id", "timestamp_ns"]).sort_index()
+
+    def _evaluate_av2(self, results, logger=None, jsonfile_prefix=None, eval_range_m=None, **kwargs):
+        """Evaluation in Argoverse2 protocol."""
+        print(f"Evaluating {len(results)} results (Argoverse2)...")
+        
+        if jsonfile_prefix is None:
+            tmp_dir = tempfile.TemporaryDirectory()
+            jsonfile_prefix = osp.join(tmp_dir.name, 'results')
+        else:
+            tmp_dir = None
+        
+        # Format predictions
+        dts = self._format_results_av2(results, jsonfile_prefix)
+        
+        if dts.empty:
+            print("No predictions to evaluate!")
+            return {}
+        
+        # Load ground truth
+        gts = self._load_av2_annotations()
+        
+        # Filter to only evaluate on frames we have predictions for
+        valid_uuids = set(dts.index.tolist()) & set(gts.index.tolist())
+        print(f"Evaluating on {len(valid_uuids)} frames with both predictions and GT")
+        
+        if len(valid_uuids) == 0:
+            print("No matching frames between predictions and GT!")
+            return {}
+        
+        gts = gts.loc[list(valid_uuids)].sort_index()
+        
+        # Import AV2 evaluation utilities
+        try:
+            from av2.evaluation import SensorCompetitionCategories
+            from projects.mmdet3d_plugin.datasets.av2_evaluation import DetectionCfg, evaluate as av2_evaluate
+        except ImportError as e:
+            print(f"Warning: Could not import AV2 evaluation modules: {e}")
+            print("Falling back to basic metrics...")
+            return self._basic_av2_metrics(dts, gts)
+        
+        # Determine evaluation categories (intersection of available categories)
+        available_categories = set(gts["category"].unique().tolist())
+        competition_categories = set(x.value for x in SensorCompetitionCategories)
+        eval_categories = available_categories & competition_categories
+        
+        # Also include categories we predict (mapped from NuScenes)
+        pred_categories = set(dts["category"].unique().tolist())
+        eval_categories = eval_categories | (pred_categories & competition_categories)
+        
+        print(f"Evaluating on categories: {sorted(eval_categories)}")
+        
+        # Setup evaluation config
+        split_dir = Path(self.data_root) / self.tri3d_dataset.split
+        cfg = DetectionCfg(
+            dataset_dir=split_dir if split_dir.exists() else None,
+            categories=tuple(sorted(eval_categories)),
+            eval_range_m=(0.0, 150.0) if eval_range_m is None else tuple(eval_range_m),
+            eval_only_roi_instances=split_dir.exists(),  # Only if we have maps
+        )
+        
+        # Run evaluation
+        try:
+            eval_dts, eval_gts, metrics, recall3d = av2_evaluate(
+                dts.reset_index(), gts.reset_index(), cfg
+            )
+        except Exception as e:
+            print(f"AV2 evaluation failed: {e}")
+            return self._basic_av2_metrics(dts.reset_index(), gts.reset_index())
+        
+        # Print results
+        valid_categories = sorted(eval_categories) + ["AVERAGE_METRICS"]
+        print("\n" + "=" * 80)
+        print("Argoverse2 Evaluation Results:")
+        print(metrics.loc[valid_categories])
+        print("=" * 80 + "\n")
+        
+        # Build result dict
+        detail = {}
+        metric_prefix = 'pts_bbox_AV2'
+        
+        for category in metrics.index:
+            for col in metrics.columns:
+                val = float(metrics.loc[category, col])
+                detail[f'{metric_prefix}/{category}/{col}'] = val
+        
+        # Add overall metrics
+        if 'AVERAGE_METRICS' in metrics.index:
+            for col in metrics.columns:
+                val = float(metrics.loc['AVERAGE_METRICS', col])
+                detail[f'{metric_prefix}/mean_{col}'] = val
+        
+        # Cleanup
+        if tmp_dir is not None:
+            tmp_dir.cleanup()
+        
+        return detail
+
+    def _basic_av2_metrics(self, dts, gts):
+        """Compute basic metrics when full AV2 evaluation is not available."""
+        print("Computing basic metrics...")
+        
+        detail = {}
+        detail['num_predictions'] = len(dts)
+        detail['num_ground_truth'] = len(gts)
+        
+        # Count predictions per category
+        if 'category' in dts.columns:
+            for cat in dts['category'].unique():
+                detail[f'num_pred_{cat}'] = int((dts['category'] == cat).sum())
+        
         return detail

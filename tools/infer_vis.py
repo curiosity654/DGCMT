@@ -256,7 +256,7 @@ def export_point_cloud_with_boxes(points, points_intensity, boxes_3d, labels_3d,
         # Handle case where boxes_3d is directly a numpy array of corners [M, 8, 3]
         box_corners_list = boxes_3d
         num_boxes = boxes_3d.shape[0]
-    else:
+    elif boxes_3d is not None:
         print("Warning: Cannot determine box corners. 'boxes_3d' should have a '.corners' attribute or be an [M, 8, 3] numpy array.")
 
     if box_corners_list is not None:
@@ -275,7 +275,7 @@ def export_point_cloud_with_boxes(points, points_intensity, boxes_3d, labels_3d,
                 all_edges.append([edge_pair[0] + vertex_offset, edge_pair[1] + vertex_offset])
 
             vertex_offset += 8 # 更新下一个框的起始索引
-    else:
+    elif boxes_3d is not None:
         print("Skipping box edge export due to issues with corner data.")
 
 
@@ -548,6 +548,7 @@ def main():
     parser.add_argument('--ckpt', type=str, default='checkpoints/isfusion_split_converted.pth')
     parser.add_argument('--out-dir', type=str, default='vis_output/infer_from_pkl')
     parser.add_argument('--iou-thr', type=float, default=0.5, help='IoU threshold for single-scene BEV evaluation')
+    parser.add_argument('--score-thr', type=float, default=0.0, help='Score threshold for visualization (filter boxes with score < threshold)')
     args = parser.parse_args()
 
     # Load dump
@@ -592,6 +593,14 @@ def main():
     pred_scores = results['scores_3d']
     pred_labels = results['labels_3d']
 
+    # Filter by score threshold
+    if args.score_thr > 0:
+        score_mask = pred_scores >= args.score_thr
+        pred_bboxes = pred_bboxes[score_mask]
+        pred_scores = pred_scores[score_mask]
+        pred_labels = pred_labels[score_mask]
+        print(f'Filtered predictions: {score_mask.sum().item()}/{len(score_mask)} boxes with score >= {args.score_thr}')
+
     # Save 3D PLY with boxes
     points_np = data['points'][0][0].detach().cpu().numpy()
     export_point_cloud_with_boxes(
@@ -612,6 +621,9 @@ def main():
         img_tensor = img_tensors[view_id]
         lidar2img = lidar2img_matrices[view_id]
 
+        # NOTE: lidar2img from dump file should already be correctly updated by the pipeline
+        # (e.g., by ResizeCropFlipImage), so we use it directly without further adjustment
+
         # To numpy (C,H,W)->(H,W,C)
         img = img_tensor.permute(1, 2, 0).contiguous().detach().cpu().numpy()
 
@@ -623,11 +635,29 @@ def main():
         img = img * std + mean
         img = np.clip(img, 0, 255).astype(np.uint8)
 
+        # 智能裁剪：检查是否有 padding
+        # 如果 img_shape > ori_shape，说明图片被 pad 了，需要裁剪回 ori_shape
+        img_metas_dict = data['img_metas'][0][0]
+        if 'ori_shape' in img_metas_dict and 'img_shape' in img_metas_dict:
+            ori_shapes = img_metas_dict['ori_shape']
+            img_shapes = img_metas_dict['img_shape']
+            if isinstance(ori_shapes, (list, tuple)) and isinstance(img_shapes, (list, tuple)):
+                if view_id < len(ori_shapes) and view_id < len(img_shapes):
+                    ori_h, ori_w = ori_shapes[view_id][:2]
+                    img_h, img_w = img_shapes[view_id][:2]
+                    curr_h, curr_w = img.shape[:2]
+                    # 如果 img_shape > ori_shape（有padding），裁剪到 ori_shape
+                    if img_h > ori_h or img_w > ori_w:
+                        # 裁剪到原始尺寸
+                        img = img[:ori_h, :ori_w]
+
         vis_img = img.copy()
 
         corners_3d = pred_bboxes.corners.detach().cpu().numpy()
+        scores_np = pred_scores.detach().cpu().numpy() if hasattr(pred_scores, 'detach') else pred_scores
         for i, corners in enumerate(corners_3d):
             label = int(pred_labels[i].item()) if hasattr(pred_labels[i], 'item') else int(pred_labels[i])
+            score = float(scores_np[i])
             color = color_map.get(label, (0, 0, 255))
 
             corners_hom = np.concatenate([corners, np.ones((8, 1))], axis=1)
@@ -635,6 +665,11 @@ def main():
             if np.all(corners_2d_hom[:, 2] > 0):
                 corners_2d = corners_2d_hom[:, :2] / corners_2d_hom[:, 2:3]
                 draw_3d_box_projection(vis_img, corners_2d, color=color, thickness=2)
+                
+                # Draw score text
+                text = f'{score:.2f}'
+                text_pos = tuple(map(int, corners_2d.mean(axis=0)))
+                cv2.putText(vis_img, text, text_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
         out_path = os.path.join(output_dir, f'vis_view_{view_id}.png')
         cv2.imwrite(out_path, vis_img)
