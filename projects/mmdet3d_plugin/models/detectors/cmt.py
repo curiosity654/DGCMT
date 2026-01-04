@@ -29,6 +29,7 @@ class CmtDetector(MVXTwoStageDetector):
 
     def __init__(self,
                  use_grid_mask=False,
+                 freeze_components=None,
                  **kwargs):
         pts_voxel_cfg = kwargs.get('pts_voxel_layer', None)
         kwargs['pts_voxel_layer'] = None
@@ -38,10 +39,64 @@ class CmtDetector(MVXTwoStageDetector):
         self.grid_mask = GridMask(True, True, rotate=1, offset=False, ratio=0.5, mode=1, prob=0.7)
         if pts_voxel_cfg:
             self.pts_voxel_layer = SPConvVoxelization(**pts_voxel_cfg)
+        
+        # Store frozen components list
+        self.freeze_components = freeze_components if freeze_components is not None else []
+        self.frozen_modules = []
 
     def init_weights(self):
         """Initialize model weights."""
         super(CmtDetector, self).init_weights()
+        
+        # Freeze specified components after weights are initialized
+        if self.freeze_components:
+            self._freeze_components()
+    
+    def _freeze_components(self):
+        """Freeze specified components to save memory and stabilize training.
+        
+        Args:
+            freeze_components (list): List of component names to freeze.
+                Supported: 'pts_voxel_encoder', 'pts_middle_encoder', 
+                          'pts_backbone', 'pts_neck', 'pts_bbox_head',
+                          'img_backbone', 'img_neck'
+        """
+        component_map = {
+            'pts_voxel_encoder': self.pts_voxel_encoder,
+            'pts_middle_encoder': self.pts_middle_encoder,
+            'pts_backbone': self.pts_backbone,
+            'pts_neck': self.pts_neck,
+            'pts_bbox_head': self.pts_bbox_head,
+            'img_backbone': self.img_backbone,
+            'img_neck': self.img_neck,
+        }
+        
+        frozen_count = 0
+        for component_name in self.freeze_components:
+            component = component_map.get(component_name)
+            if component is not None:
+                for param in component.parameters():
+                    param.requires_grad = False
+                    frozen_count += 1
+                # Set to eval mode to freeze BN stats
+                component.eval()
+                self.frozen_modules.append(component)
+                print(f"Frozen component: {component_name} ({frozen_count} parameters)")
+            else:
+                print(f"Warning: Component '{component_name}' not found, skipping freeze.")
+        
+        if frozen_count > 0:
+            print(f"Total frozen parameters: {frozen_count}")
+    
+    def train(self, mode=True):
+        """Override train to keep frozen modules in eval mode."""
+        super(CmtDetector, self).train(mode)
+        
+        # Keep frozen components in eval mode
+        for module in self.frozen_modules:
+            module.eval()
+        
+        return self
 
     @auto_fp16(apply_to=('img'), out_fp32=True) 
     def extract_img_feat(self, img, img_metas):
