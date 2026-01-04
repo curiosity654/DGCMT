@@ -499,6 +499,7 @@ class ResizeCropFlipImage(object):
 
         results["img"] = new_imgs
         results["depths"] = new_depths
+        results['ori_shape'] = [img.shape for img in new_imgs]  # 记录变换后的原始尺寸，供后续 padding 参考
         results['img_shape'] = [img.shape for img in new_imgs]
         results['pad_shape'] = [img.shape for img in new_imgs]
         results['lidar2img'] = [results['cam_intrinsic'][i] @ results['lidar2cam'][i] for i in range(len(results['lidar2cam']))]

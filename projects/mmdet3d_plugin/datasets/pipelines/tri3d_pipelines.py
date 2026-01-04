@@ -258,8 +258,9 @@ class LoadAnnotationsFromTri3D:
             # 2. Dimensions:
             # Tri3D size is [Length, Width, Height]
             l_tri3d, w_tri3d, h_tri3d = box.size
-
-            # In LiDARInstance3DBoxes, the order is [x, y, z, l, w, h, yaw]
+            
+            # NuScenes pkl format is also [x, y, z, L, W, H, yaw]
+            # So the order matches directly
             l, w, h = l_tri3d, w_tri3d, h_tri3d
 
             # 3. Velocity:
@@ -321,4 +322,12 @@ class LoadAnnotationsFromTri3D:
         )
         results["gt_labels_3d"] = gt_labels_3d
         results["gt_attributes_3d"] = gt_attributes_3d
+        
+        # CRITICAL: Register gt_bboxes_3d in bbox3d_fields so that downstream
+        # transforms (GlobalRotScaleTransAll, CustomRandomFlip3D, etc.) will
+        # apply the same transformations to GT boxes as they do to points
+        if 'bbox3d_fields' not in results:
+            results['bbox3d_fields'] = []
+        results['bbox3d_fields'].append('gt_bboxes_3d')
+        
         return results
