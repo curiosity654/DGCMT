@@ -360,7 +360,7 @@ log_config = dict(
     interval=50,
     hooks=[dict(type='TextLoggerHook'),
            dict(type='TensorboardLoggerHook'),
-           dict(type='WandbLoggerHook',init_kwargs=dict(project='DGFusion', name='cmt_voxel0075_vov_1600x640_cbgs-pretrained',))])
+           dict(type='WandbLoggerHook',init_kwargs=dict(project='DGFusion', name='cmt_voxel0075_vov_1600x640_cbgs-pretrained-freeze_lidar',))])
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
 work_dir = None
