@@ -353,17 +353,17 @@ momentum_config = dict(
     target_ratio=(0.8947368421052632, 1),
     cyclic_times=1,
     step_ratio_up=0.4)
-total_epochs = 20
+total_epochs = 6
 checkpoint_config = dict(interval=1)
 log_config = dict(
     interval=50,
     hooks=[dict(type='TextLoggerHook'),
            dict(type='TensorboardLoggerHook'),
-           dict(type='WandbLoggerHook',init_kwargs=dict(project='DGFusion', name='cmt_voxel0075_vov_1600x640_cbgs',))])
+           dict(type='WandbLoggerHook',init_kwargs=dict(project='DGFusion', name='cmt_voxel0075_vov_1600x640_cbgs-pretrained',))])
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
 work_dir = None
-load_from='checkpoints/fcos3d_vovnet_imgbackbone-remapped.pth'
+load_from='checkpoints/fusion_pretrained_merged.pth'
 resume_from = None
 workflow = [('train', 1)]
 gpu_ids = range(0, 8)
