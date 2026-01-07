@@ -1,2 +1,4 @@
 from .optimizer import CustomFp16OptimizerHook
 from .optimizer import CustomFp16GradientCumulativeOptimizerHook
+
+from .drop_aug_hook import DropAugmentationHook
