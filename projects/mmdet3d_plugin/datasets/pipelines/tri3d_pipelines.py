@@ -29,9 +29,10 @@ class LoadPointsFromTri3D:
         self.sweeps_num = sweeps_num
         self.undo_z_rotation = undo_z_rotation
         self.timestamp_unit = timestamp_unit
-        # Inverse of the Z-90 rotation that Tri3D applies to NuScenes
+        # Tri3D has rotated coordinates. To convert back to native NuScenes:
+        # Apply +90° rotation
         if undo_z_rotation:
-            self.undo_tri3d_rot = Rotation.from_euler("Z", -np.pi / 2)
+            self.undo_tri3d_rot = Rotation.from_euler("Z", np.pi / 2)
         else:
             self.undo_tri3d_rot = None
 
@@ -121,7 +122,7 @@ class LoadMultiViewImageFromTri3D:
     def __init__(self, undo_z_rotation=True):
         self.undo_z_rotation = undo_z_rotation
         if undo_z_rotation:
-            self.undo_tri3d_rot = Rotation.from_euler("Z", -np.pi / 2)
+            self.undo_tri3d_rot = Rotation.from_euler("Z", np.pi / 2)
         else:
             self.undo_tri3d_rot = None
 
@@ -206,7 +207,7 @@ class LoadAnnotationsFromTri3D:
     def __init__(self, undo_z_rotation=True):
         self.undo_z_rotation = undo_z_rotation
         if undo_z_rotation:
-            self.undo_tri3d_rot = Rotation.from_euler("Z", -np.pi / 2)
+            self.undo_tri3d_rot = Rotation.from_euler("Z", np.pi / 2)
         else:
             self.undo_tri3d_rot = None
         # nuScenes official attributes mapping

@@ -29,6 +29,64 @@ def get_color_map(class_names):
         color_map[i] = tuple(map(int, color_bgr))
     return color_map
 
+def draw_orientation_arrow(img, corners_3d, lidar2img, color, arrow_length=2.0):
+    """在 2D 图像中绘制 3D 物体朝向箭头
+    
+    Args:
+        img: 图像数组
+        corners_3d: 3D box 的 8 个角点 [8, 3]
+        lidar2img: 投影矩阵 [4, 4]
+        color: 箭头颜色
+        arrow_length: 箭头长度（米），默认 2.0 米
+    """
+    # 计算 3D box 的中心点
+    center_3d = corners_3d.mean(axis=0)  # [3]
+    
+    # 计算前方向：从底面4个点的中心到前面2个点的中心
+    # 对于 LiDARInstance3DBoxes，通常 corners 的索引：
+    # 底面：0-3，顶面：4-7
+    # 前面通常是索引 0,1,4,5
+    bottom_center = corners_3d[:4].mean(axis=0)  # 底面中心
+    front_center = corners_3d[[0, 1, 4, 5]].mean(axis=0)  # 前面中心
+    
+    # 计算方向向量
+    direction = front_center - bottom_center
+    # 归一化
+    if np.linalg.norm(direction) > 1e-6:
+        direction = direction / np.linalg.norm(direction)
+    else:
+        # 如果无法计算方向，使用 X 轴正方向
+        direction = np.array([1.0, 0.0, 0.0])
+    
+    # 箭头终点：从中心沿方向延伸
+    arrow_end_3d = center_3d + direction * arrow_length
+    
+    # 投影到 2D
+    center_hom = np.append(center_3d, 1.0)  # [4]
+    arrow_end_hom = np.append(arrow_end_3d, 1.0)  # [4]
+    
+    center_2d_hom = lidar2img @ center_hom  # [4]
+    arrow_end_2d_hom = lidar2img @ arrow_end_hom  # [4]
+    
+    # 检查深度是否为正
+    if center_2d_hom[2] > 0 and arrow_end_2d_hom[2] > 0:
+        # 透视除法
+        center_2d = center_2d_hom[:2] / center_2d_hom[2]
+        arrow_end_2d = arrow_end_2d_hom[:2] / arrow_end_2d_hom[2]
+        
+        # 检查坐标是否有效
+        if np.all(np.isfinite(center_2d)) and np.all(np.isfinite(arrow_end_2d)):
+            # 转换为整数坐标
+            pt_start = (int(center_2d[0]), int(center_2d[1]))
+            pt_end = (int(arrow_end_2d[0]), int(arrow_end_2d[1]))
+            
+            # 绘制箭头（线宽 3，箭头大小 0.3）
+            cv2.arrowedLine(img, pt_start, pt_end, color, 3, tipLength=0.3)
+            
+            return True
+    
+    return False
+
 def extract_result(dc):
     """从 DataContainer 中提取结果"""
     if hasattr(dc, 'data'):
@@ -147,6 +205,8 @@ def main():
     parser.add_argument('--split', default='vis', choices=['train', 'val', 'test', 'vis'], help='Dataset split to use')
     parser.add_argument('--out-dir', default='vis_output/gt')
     parser.add_argument('--gt', action='store_true', help='Whether to visualize GT boxes')
+    parser.add_argument('--show-orientation', action='store_true', help='Whether to show orientation arrows')
+    parser.add_argument('--arrow-length', type=float, default=2.0, help='Length of orientation arrow in meters')
     parser.add_argument('--dump', action='store_true', help='Whether to dump data to pkl')
     parser.add_argument('--dump-path', type=str, default=None, help='Path to dump pkl')
     args = parser.parse_args()
@@ -292,6 +352,10 @@ def main():
                         pt2 = (int(p2[0]), int(p2[1]))
                         
                         cv2.line(img, pt1, pt2, color, 2)
+                    
+                    # 绘制朝向箭头
+                    if args.show_orientation:
+                        draw_orientation_arrow(img, corners, lidar2img[view_id], color, arrow_length=args.arrow_length)
 
         out_img_path = os.path.join(output_dir, f'view_{view_id}.jpg')
         cv2.imwrite(out_img_path, img)
