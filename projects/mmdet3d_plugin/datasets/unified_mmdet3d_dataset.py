@@ -674,13 +674,9 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
             boxes = self.tri3d_dataset.boxes(seq, frame, coords=sensor)
             
             for box in boxes:
-                # Map to NuScenes class first, then to AV2
-                mapped_label = self._map_label(box.label)
-                if mapped_label is None:
-                    # Use original AV2 label
-                    av2_cls = box.label
-                else:
-                    av2_cls = self.NUSC_TO_AV2_MAPPING.get(mapped_label, box.label)
+                # Keep original AV2 category to avoid losing information
+                # from many-to-one-to-one mapping (e.g., BOX_TRUCK->truck->TRUCK)
+                av2_cls = box.label
                 
                 quat = self._yaw_to_quat(box.heading)
                 z_center = box.center[2]  # Tri3D boxes are already at gravity center
