@@ -97,6 +97,28 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
         'traffic_cone': 'CONSTRUCTION_CONE',
     }
 
+    # Waymo to NuScenes 10-class mapping (for training/inference)
+    WAYMO_MAPPING = {
+        'VEHICLE': 'car',
+        'PEDESTRIAN': 'pedestrian',
+        'CYCLIST': 'bicycle',
+        'SIGN': 'barrier',
+    }
+
+    # NuScenes 10-class to Waymo mapping (for evaluation)
+    NUSC_TO_WAYMO_MAPPING = {
+        'car': 'VEHICLE',
+        'truck': 'VEHICLE',
+        'construction_vehicle': 'VEHICLE',
+        'bus': 'VEHICLE',
+        'trailer': 'VEHICLE',
+        'motorcycle': 'CYCLIST',
+        'bicycle': 'CYCLIST',
+        'pedestrian': 'PEDESTRIAN',
+        'barrier': 'SIGN',
+        'traffic_cone': 'SIGN',
+    }
+
     # nuScenes official attributes mapping
     ATTR_TABLE = [
         "cycle.with_rider",
@@ -158,6 +180,8 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
             self.cat_mapping = self.NUSC_MAPPING
         elif dataset_type == 'Argoverse2':
             self.cat_mapping = self.ARGO2_MAPPING
+        elif dataset_type == 'Waymo':
+            self.cat_mapping = self.WAYMO_MAPPING
         else:
             self.cat_mapping = {}
 
@@ -257,6 +281,13 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
                     timestamp_ns = int(self.tri3d_dataset.timestamps(seq, sensor)[frame])
                     data_info['log_id'] = log_id
                     data_info['timestamp_ns'] = timestamp_ns
+                elif self.dataset_type_name == 'Waymo':
+                    log_id = self.tri3d_dataset.records[seq]
+                    timestamp_micros = int(
+                        self.tri3d_dataset.timestamps(seq, sensor)[frame] * 1e6
+                    )
+                    data_info['log_id'] = log_id
+                    data_info['timestamp_micros'] = timestamp_micros
 
                 data_infos.append(data_info)
         
@@ -403,6 +434,8 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
         """Format the results based on dataset type."""
         if self.dataset_type_name == 'Argoverse2':
             return self._format_results_av2(outputs, jsonfile_prefix)
+        if self.dataset_type_name == 'Waymo':
+            return self._format_results_waymo(outputs, jsonfile_prefix)
         else:
             return self._format_results_nusc(outputs, jsonfile_prefix)
 
@@ -438,6 +471,8 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
         """Evaluation based on dataset type."""
         if self.dataset_type_name == 'Argoverse2':
             return self._evaluate_av2(results, logger, jsonfile_prefix, **kwargs)
+        if self.dataset_type_name == 'Waymo':
+            return self._evaluate_waymo(results, logger, jsonfile_prefix, **kwargs)
         else:
             return self._evaluate_nusc(results, logger, jsonfile_prefix, **kwargs)
 
@@ -541,6 +576,314 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
         if tmp_dir is not None:
             tmp_dir.cleanup()
             
+        return detail
+
+    # ==================== Waymo Evaluation Methods ====================
+
+    def _format_bbox_waymo(self, results, log_id, timestamp_micros):
+        """Convert predictions to Waymo-like format for a single frame."""
+        if "pts_bbox" in results:
+            bboxes = results["pts_bbox"]["boxes_3d"]
+            scores = results["pts_bbox"]["scores_3d"]
+            labels = results["pts_bbox"]["labels_3d"]
+        else:
+            bboxes = results["boxes_3d"]
+            scores = results["scores_3d"]
+            labels = results["labels_3d"]
+
+        bboxes_tensor = bboxes.tensor.cpu().numpy()
+        scores = scores.cpu().numpy()
+        labels = labels.cpu().numpy()
+
+        waymo_boxes = []
+        for i in range(len(bboxes_tensor)):
+            x, y, z, l, w, h, yaw = bboxes_tensor[i, :7]
+            z_center = z + h / 2.0
+            cls_name = self.CLASSES[labels[i]]
+            waymo_cls = self.NUSC_TO_WAYMO_MAPPING.get(cls_name, 'UNKNOWN')
+
+            waymo_boxes.append({
+                'center_x': float(x),
+                'center_y': float(y),
+                'center_z': float(z_center),
+                'length': float(l),
+                'width': float(w),
+                'height': float(h),
+                'heading': float(yaw),
+                'score': float(scores[i]),
+                'category': waymo_cls,
+                'log_id': log_id,
+                'timestamp_micros': int(timestamp_micros),
+            })
+
+        return waymo_boxes
+
+    def _format_results_waymo(self, outputs, jsonfile_prefix=None):
+        """Format the results to a simple Waymo DataFrame format."""
+        print(f"Formatting {len(outputs)} results for Waymo...")
+
+        all_boxes = []
+        for i, out in enumerate(outputs):
+            info = self.data_infos[i]
+            log_id = info.get('log_id')
+            timestamp_micros = info.get('timestamp_micros')
+            if log_id is None or timestamp_micros is None:
+                continue
+            frame_boxes = self._format_bbox_waymo(out, log_id, timestamp_micros)
+            all_boxes.extend(frame_boxes)
+
+        if len(all_boxes) == 0:
+            print("Warning: No boxes to format!")
+            return pd.DataFrame()
+
+        dts = pd.DataFrame(all_boxes).sort_values("score", ascending=False)
+
+        if jsonfile_prefix is not None:
+            feather_path = f"{jsonfile_prefix}_waymo_dts.feather"
+            dts.to_feather(feather_path)
+            print(f"Results saved to {feather_path}")
+
+        persistent_path = osp.join(self.data_root, f'{self.tri3d_dataset.split}_dts.feather')
+        dts.to_feather(persistent_path)
+        print(f"Results also saved to {persistent_path}")
+
+        return dts.set_index(["log_id", "timestamp_micros"]).sort_index()
+
+    def _load_waymo_annotations(self):
+        """Load Waymo ground truth annotations."""
+        anno_path = osp.join(self.data_root, f'{self.tri3d_dataset.split}_anno.feather')
+
+        if osp.exists(anno_path):
+            print(f"Loading cached annotations from {anno_path}")
+            gts = pd.read_feather(anno_path)
+            return gts.set_index(["log_id", "timestamp_micros"]).sort_index()
+
+        print("Building annotations from Tri3D dataset...")
+        all_gts = []
+
+        for info in self.data_infos:
+            seq = info['seq']
+            frame = info['frame']
+            sensor = info['sensor']
+            log_id = info.get('log_id')
+            timestamp_micros = info.get('timestamp_micros')
+            if log_id is None or timestamp_micros is None:
+                continue
+
+            boxes = self.tri3d_dataset.boxes(seq, frame, coords=sensor)
+            for box in boxes:
+                num_pts = getattr(box, 'num_lidar_points_in_box', 0)
+                all_gts.append({
+                    'center_x': float(box.center[0]),
+                    'center_y': float(box.center[1]),
+                    'center_z': float(box.center[2]),
+                    'length': float(box.size[0]),
+                    'width': float(box.size[1]),
+                    'height': float(box.size[2]),
+                    'heading': float(box.heading),
+                    'num_lidar_points_in_box': int(num_pts),
+                    'category': box.label,
+                    'log_id': log_id,
+                    'timestamp_micros': int(timestamp_micros),
+                })
+
+        gts = pd.DataFrame(all_gts)
+        gts.to_feather(anno_path)
+        print(f"Cached annotations to {anno_path}")
+
+        return gts.set_index(["log_id", "timestamp_micros"]).sort_index()
+
+    def _evaluate_waymo(self, results, logger=None, jsonfile_prefix=None, **kwargs):
+        """Evaluation in Waymo protocol (official metrics)."""
+        print(f"Evaluating {len(results)} results (Waymo)...")
+
+        try:
+            import tensorflow as tf
+            from waymo_open_dataset import label_pb2
+            from waymo_open_dataset.metrics.python import config_util_py
+            from waymo_open_dataset.metrics.python import wod_detection_evaluator
+        except Exception as exc:
+            raise ImportError(
+                "waymo_open_dataset is required for official Waymo metrics. "
+                "Install via: pip install waymo-open-dataset-tf-2-12-0==1.6.7"
+            ) from exc
+
+        pred_frame_ids = []
+        pred_bboxes = []
+        pred_types = []
+        pred_scores = []
+        pred_overlap_nlz = []
+
+        type_map = {
+            'VEHICLE': label_pb2.Label.TYPE_VEHICLE,
+            'PEDESTRIAN': label_pb2.Label.TYPE_PEDESTRIAN,
+            'CYCLIST': label_pb2.Label.TYPE_CYCLIST,
+            'SIGN': label_pb2.Label.TYPE_SIGN,
+        }
+
+        for i, out in enumerate(results):
+            frame_id = i
+            if "pts_bbox" in out:
+                bboxes = out["pts_bbox"]["boxes_3d"]
+                scores = out["pts_bbox"]["scores_3d"]
+                labels = out["pts_bbox"]["labels_3d"]
+            else:
+                bboxes = out["boxes_3d"]
+                scores = out["scores_3d"]
+                labels = out["labels_3d"]
+
+            bboxes_tensor = bboxes.tensor.cpu().numpy()
+            scores = scores.cpu().numpy()
+            labels = labels.cpu().numpy()
+
+            for j in range(len(bboxes_tensor)):
+                x, y, z, l, w, h, yaw = bboxes_tensor[j, :7]
+                z_center = z + h / 2.0
+                cls_name = self.CLASSES[labels[j]]
+                waymo_cls = self.NUSC_TO_WAYMO_MAPPING.get(cls_name)
+                if waymo_cls is None or waymo_cls not in type_map:
+                    continue
+                pred_frame_ids.append(frame_id)
+                pred_bboxes.append([x, y, z_center, l, w, h, yaw])
+                pred_types.append(type_map[waymo_cls])
+                pred_scores.append(float(scores[j]))
+                pred_overlap_nlz.append(False)
+
+        gt_frame_ids = []
+        gt_bboxes = []
+        gt_types = []
+        gt_difficulty = []
+        gt_speed = []
+
+        for i, info in enumerate(self.data_infos):
+            seq = info['seq']
+            frame = info['frame']
+            sensor = info['sensor']
+            boxes = self.tri3d_dataset.boxes(seq, frame, coords=sensor)
+
+            for box in boxes:
+                if box.label not in type_map:
+                    continue
+                gt_frame_ids.append(i)
+                gt_bboxes.append([
+                    float(box.center[0]),
+                    float(box.center[1]),
+                    float(box.center[2]),
+                    float(box.size[0]),
+                    float(box.size[1]),
+                    float(box.size[2]),
+                    float(box.heading),
+                ])
+                gt_types.append(type_map[box.label])
+                diff = getattr(box, 'difficulty_level_det', 1)
+                gt_difficulty.append(label_pb2.Label.LEVEL_2 if diff == 2 else label_pb2.Label.LEVEL_1)
+                if hasattr(box, 'speed'):
+                    gt_speed.append([float(box.speed[0]), float(box.speed[1])])
+
+        if len(pred_bboxes) == 0:
+            print("No predictions to evaluate!")
+            return {}
+
+        if len(gt_bboxes) == 0:
+            print("No ground truth boxes to evaluate!")
+            return {}
+
+        predictions = dict(
+            prediction_frame_id=tf.constant(pred_frame_ids, dtype=tf.int64),
+            prediction_bbox=tf.constant(pred_bboxes, dtype=tf.float32),
+            prediction_type=tf.constant(pred_types, dtype=tf.uint8),
+            prediction_score=tf.constant(pred_scores, dtype=tf.float32),
+            prediction_overlap_nlz=tf.constant(pred_overlap_nlz, dtype=tf.bool),
+        )
+
+        groundtruths = dict(
+            ground_truth_frame_id=tf.constant(gt_frame_ids, dtype=tf.int64),
+            ground_truth_bbox=tf.constant(gt_bboxes, dtype=tf.float32),
+            ground_truth_type=tf.constant(gt_types, dtype=tf.uint8),
+            ground_truth_difficulty=tf.constant(gt_difficulty, dtype=tf.uint8),
+        )
+
+        if len(gt_speed) == len(gt_bboxes):
+            groundtruths['ground_truth_speed'] = tf.constant(gt_speed, dtype=tf.float32)
+
+        evaluator = wod_detection_evaluator.WODDetectionEvaluator()
+        evaluator.update_state(groundtruths, predictions)
+        metrics = evaluator.result()
+
+        breakdown_names = config_util_py.get_breakdown_names_from_config(evaluator._config)
+        ap = metrics.average_precision.numpy()
+        aph = metrics.average_precision_ha_weighted.numpy()
+
+        detail = {}
+        metric_prefix = 'pts_bbox_Waymo'
+        for name, ap_val, aph_val in zip(breakdown_names, ap, aph):
+            detail[f'{metric_prefix}/{name}/mAP'] = float(ap_val)
+            detail[f'{metric_prefix}/{name}/mAPH'] = float(aph_val)
+
+        def get_metric(name, values):
+            try:
+                idx = breakdown_names.index(name)
+            except ValueError:
+                return None
+            return float(values[idx])
+
+        summary_types = ['VEHICLE', 'PEDESTRIAN', 'CYCLIST']
+        for obj_type in ['VEHICLE', 'PEDESTRIAN', 'CYCLIST', 'SIGN']:
+            for level in ['LEVEL_1', 'LEVEL_2']:
+                key = f'OBJECT_TYPE_TYPE_{obj_type}_{level}'
+                ap_val = get_metric(key, ap)
+                aph_val = get_metric(key, aph)
+                if ap_val is not None:
+                    detail[f'{metric_prefix}/{obj_type}/{"L1" if level.endswith("1") else "L2"} mAP'] = ap_val
+                if aph_val is not None:
+                    detail[f'{metric_prefix}/{obj_type}/{"L1" if level.endswith("1") else "L2"} mAPH'] = aph_val
+
+        for level in ['LEVEL_1', 'LEVEL_2']:
+            ap_vals = []
+            aph_vals = []
+            for obj_type in summary_types:
+                key = f'OBJECT_TYPE_TYPE_{obj_type}_{level}'
+                ap_val = get_metric(key, ap)
+                aph_val = get_metric(key, aph)
+                if ap_val is not None:
+                    ap_vals.append(ap_val)
+                if aph_val is not None:
+                    aph_vals.append(aph_val)
+            if ap_vals:
+                detail[f'{metric_prefix}/Overall/{"L1" if level.endswith("1") else "L2"} mAP'] = float(sum(ap_vals) / len(ap_vals))
+            if aph_vals:
+                detail[f'{metric_prefix}/Overall/{"L1" if level.endswith("1") else "L2"} mAPH'] = float(sum(aph_vals) / len(aph_vals))
+
+        print("\n" + "=" * 80)
+        print("Waymo Evaluation Results (Official):")
+        for key in [
+            f'{metric_prefix}/Overall/L1 mAP',
+            f'{metric_prefix}/Overall/L1 mAPH',
+            f'{metric_prefix}/Overall/L2 mAP',
+            f'{metric_prefix}/Overall/L2 mAPH',
+        ]:
+            if key in detail:
+                print(f"{key}: {detail[key]:.4f}")
+        print("=" * 80 + "\n")
+
+        return detail
+
+    def _basic_waymo_metrics(self, dts, gts):
+        """Compute basic metrics when Waymo SDK is not available."""
+        print("Computing basic metrics (Waymo)...")
+
+        detail = {}
+        detail['num_predictions'] = len(dts)
+        detail['num_ground_truth'] = len(gts)
+
+        if 'category' in dts.columns:
+            for cat in dts['category'].unique():
+                detail[f'num_pred_{cat}'] = int((dts['category'] == cat).sum())
+
+        if 'category' in gts.columns:
+            for cat in gts['category'].unique():
+                detail[f'num_gt_{cat}'] = int((gts['category'] == cat).sum())
+
         return detail
     # ==================== Argoverse2 Evaluation Methods ====================
 

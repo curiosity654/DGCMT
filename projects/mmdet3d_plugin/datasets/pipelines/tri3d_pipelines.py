@@ -137,6 +137,9 @@ class LoadMultiViewImageFromTri3D:
         
         for cam_sensor in dataset.cam_sensors:
             cam_timestamps = dataset.timestamps(seq, cam_sensor)
+            if len(cam_timestamps) == 0:
+                # Skip sensors that are not present in this split/record.
+                continue
             idx = np.searchsorted(cam_timestamps, target_timestamp)
             cam_frame = int(max(0, min(len(cam_timestamps)-1, idx)))
             
@@ -186,6 +189,11 @@ class LoadMultiViewImageFromTri3D:
             lidar2cam_rts.append(lidar2cam)
             lidar2img_rts.append(lidar2img)
             cam_intrinsics.append(cam_intrinsic)
+
+        if len(imgs) == 0:
+            raise ValueError(
+                f"No camera frames available for seq={seq}, frame={lidar_frame}."
+            )
 
         results.update(dict(
             img=imgs, lidar2img=lidar2img_rts, lidar2cam=lidar2cam_rts,
