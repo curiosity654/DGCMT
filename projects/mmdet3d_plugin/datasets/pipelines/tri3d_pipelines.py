@@ -156,33 +156,46 @@ class LoadMultiViewImageFromTri3D:
                         break
 
             try:
-                # Compute lidar to camera transformation
-                l2c_transform = dataset.alignment(seq, (lidar_frame, cam_frame), (lidar_sensor, cam_sensor))
-                
-                if self.undo_tri3d_rot is not None:
-                    # IMPORTANT: UNDO the LIDAR rotation for lidar2cam and lidar2img
-                    # Tri3D: l2c = Cam_pose.inv() @ Lidar_pose_tri3d
-                    # We want: l2c_native = Cam_pose.inv() @ Lidar_pose_native
-                    # Lidar_pose_tri3d = Lidar_pose_native @ R
-                    # So: l2c_native = l2c @ R^(-1)
-                    lidar2cam = as_matrix(l2c_transform) @ np.linalg.inv(self.undo_tri3d_rot.as_matrix())
+                dataset_name = getattr(dataset, "obj", dataset).__class__.__name__
+                if dataset_name == "KITTI":
+                    calib = dataset._load_calib(lidar_frame)
+                    p_key = "P2" if img_plane_sensor == "IMG2" else "P3"
+                    proj = calib[p_key]
+                    proj_4x4 = np.eye(4, dtype=np.float32)
+                    proj_4x4[:3, :4] = proj
+                    rect = calib["R0_rect"]
+                    velo2cam = calib["Tr_velo_to_cam"]
+                    lidar2cam = rect @ velo2cam
+                    lidar2img = proj_4x4 @ lidar2cam
+                    cam_intrinsic = np.eye(4, dtype=np.float32)
                 else:
-                    lidar2cam = as_matrix(l2c_transform)
-                    
-                c2i_transform = dataset.alignment(seq, cam_frame, (cam_sensor, img_plane_sensor))
-                cam_intrinsic = np.eye(4)
-                target = c2i_transform
-                if isinstance(target, Pipeline):
-                    for op in target.operations:
-                        if hasattr(op, 'intrinsics'):
-                            target = op; break
-                
-                if hasattr(target, 'intrinsics'):
-                    fx, fy, cx, cy = target.intrinsics[:4]
-                    cam_intrinsic[0, 0], cam_intrinsic[1, 1] = fx, fy
-                    cam_intrinsic[0, 2], cam_intrinsic[1, 2] = cx, cy
-                
-                lidar2img = cam_intrinsic @ lidar2cam
+                    # Compute lidar to camera transformation
+                    l2c_transform = dataset.alignment(seq, (lidar_frame, cam_frame), (lidar_sensor, cam_sensor))
+
+                    if self.undo_tri3d_rot is not None:
+                        # IMPORTANT: UNDO the LIDAR rotation for lidar2cam and lidar2img
+                        # Tri3D: l2c = Cam_pose.inv() @ Lidar_pose_tri3d
+                        # We want: l2c_native = Cam_pose.inv() @ Lidar_pose_native
+                        # Lidar_pose_tri3d = Lidar_pose_native @ R
+                        # So: l2c_native = l2c @ R^(-1)
+                        lidar2cam = as_matrix(l2c_transform) @ np.linalg.inv(self.undo_tri3d_rot.as_matrix())
+                    else:
+                        lidar2cam = as_matrix(l2c_transform)
+
+                    c2i_transform = dataset.alignment(seq, cam_frame, (cam_sensor, img_plane_sensor))
+                    cam_intrinsic = np.eye(4)
+                    target = c2i_transform
+                    if isinstance(target, Pipeline):
+                        for op in target.operations:
+                            if hasattr(op, 'intrinsics'):
+                                target = op; break
+
+                    if hasattr(target, 'intrinsics'):
+                        fx, fy, cx, cy = target.intrinsics[:4]
+                        cam_intrinsic[0, 0], cam_intrinsic[1, 1] = fx, fy
+                        cam_intrinsic[0, 2], cam_intrinsic[1, 2] = cx, cy
+
+                    lidar2img = cam_intrinsic @ lidar2cam
             except:
                 lidar2cam = lidar2img = cam_intrinsic = np.eye(4)
 
@@ -340,3 +353,4 @@ class LoadAnnotationsFromTri3D:
         results['bbox3d_fields'].append('gt_bboxes_3d')
         
         return results
+

@@ -1,8 +1,7 @@
-# projects/configs/fusion/eval_config_unified_waymo.py
+# projects/configs/fusion/eval_config_unified_kitti.py
 _base_ = ['./cmt_voxel0075_vov_1600x640_cbgs-wo_gtsample-unified_dataset.py']
 
-data_root = 'data/waymo_optimized'
-timeline_root = 'data/waymo_timeline'
+data_root = 'data/KITTI'
 
 img_norm_cfg = dict(
     mean=[103.530, 116.280, 123.675], std=[57.375, 57.120, 58.395], to_rgb=False)
@@ -16,8 +15,8 @@ test_pipeline = [
     dict(
         type='LoadPointsFromTri3D',
         coord_type='LIDAR',
-        load_dim=5,
-        use_dim=[0, 1, 2, 3, 4],
+        load_dim=4,
+        use_dim=[0, 1, 2, 3],
         sweeps_num=0,
         undo_z_rotation=False,
         timestamp_unit=1.0,
@@ -50,14 +49,12 @@ test_pipeline = [
 ]
 
 data = dict(
-    workers_per_gpu=8,
     test=dict(
         _delete_=True,
         type='UnifiedMMDet3DDataset',
-        dataset_type='Waymo',
-        data_root=data_root,
-        tri3d_kwargs=dict(timeline_root=timeline_root),
-        split='validation',
+        dataset_type='KITTI',
+        data_root='data/KITTI',
+        split='training',
         pipeline=test_pipeline,
         classes=class_names,
         modality=dict(

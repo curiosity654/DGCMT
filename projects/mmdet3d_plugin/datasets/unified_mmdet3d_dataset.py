@@ -97,6 +97,29 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
         'traffic_cone': 'CONSTRUCTION_CONE',
     }
 
+    # KITTI to NuScenes 10-class mapping (for training/inference)
+    KITTI_MAPPING = {
+        'Car': 'car',
+        'Van': 'car',
+        'Truck': 'truck',
+        'Pedestrian': 'pedestrian',
+        'Person_sitting': 'pedestrian',
+        'Cyclist': 'bicycle',
+        'Tram': 'bus',
+    }
+
+    # NuScenes 10-class to KITTI mapping (for evaluation)
+    NUSC_TO_KITTI_MAPPING = {
+        'car': 'Car',
+        'truck': 'Van',
+        'construction_vehicle': 'Van',
+        'bus': 'Van',
+        'trailer': 'Van',
+        'pedestrian': 'Pedestrian',
+        'bicycle': 'Cyclist',
+        'motorcycle': 'Cyclist',
+    }
+
     # Waymo to NuScenes 10-class mapping (for training/inference)
     WAYMO_MAPPING = {
         'VEHICLE': 'car',
@@ -168,7 +191,7 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
             tri3d_kwargs['subset'] = subset
         if split is not None:
             tri3d_kwargs['split'] = split
-        
+        tri3d_kwargs.update(kwargs.pop('tri3d_kwargs', {}))
         # Initialize Tri3D dataset and wrap it to prevent deepcopy overhead
         tri3d_dataset = self.tri3d_cls(data_root, **tri3d_kwargs)
         self.tri3d_dataset = Tri3DObjectWrapper(tri3d_dataset)
@@ -182,6 +205,8 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
             self.cat_mapping = self.ARGO2_MAPPING
         elif dataset_type == 'Waymo':
             self.cat_mapping = self.WAYMO_MAPPING
+        elif dataset_type == 'KITTI':
+            self.cat_mapping = self.KITTI_MAPPING
         else:
             self.cat_mapping = {}
 
@@ -436,6 +461,8 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
             return self._format_results_av2(outputs, jsonfile_prefix)
         if self.dataset_type_name == 'Waymo':
             return self._format_results_waymo(outputs, jsonfile_prefix)
+        if self.dataset_type_name == 'KITTI':
+            return self._format_results_kitti(outputs, jsonfile_prefix)
         else:
             return self._format_results_nusc(outputs, jsonfile_prefix)
 
@@ -473,6 +500,8 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
             return self._evaluate_av2(results, logger, jsonfile_prefix, **kwargs)
         if self.dataset_type_name == 'Waymo':
             return self._evaluate_waymo(results, logger, jsonfile_prefix, **kwargs)
+        if self.dataset_type_name == 'KITTI':
+            return self._evaluate_kitti(results, logger, jsonfile_prefix, **kwargs)
         else:
             return self._evaluate_nusc(results, logger, jsonfile_prefix, **kwargs)
 
@@ -883,6 +912,174 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
         if 'category' in gts.columns:
             for cat in gts['category'].unique():
                 detail[f'num_gt_{cat}'] = int((gts['category'] == cat).sum())
+
+        return detail
+
+    # ==================== KITTI Evaluation Methods ====================
+
+    def _load_kitti_gts(self):
+        """Load KITTI ground truth annotations from label_2 files."""
+        gt_annos = []
+        for info in self.data_infos:
+            frame = info['frame']
+            frame_id = self.tri3d_dataset._frame_id(frame)
+            label_path = (
+                Path(self.data_root) / self.tri3d_dataset.split / "label_2" / f"{frame_id}.txt"
+            )
+
+            names, truncated, occluded, alpha = [], [], [], []
+            bboxes, dimensions, locations, rotation_y = [], [], [], []
+
+            if label_path.exists():
+                with open(label_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        fields = line.strip().split()
+                        if len(fields) < 15:
+                            continue
+                        names.append(fields[0])
+                        truncated.append(float(fields[1]))
+                        occluded.append(int(fields[2]))
+                        alpha.append(float(fields[3]))
+                        bbox = [float(x) for x in fields[4:8]]
+                        dims = [float(fields[8]), float(fields[9]), float(fields[10])]
+                        loc = [float(fields[11]), float(fields[12]), float(fields[13])]
+                        ry = float(fields[14])
+                        bboxes.append(bbox)
+                        dimensions.append(dims)
+                        locations.append(loc)
+                        rotation_y.append(ry)
+
+            anno = {
+                'name': np.array(names),
+                'truncated': np.array(truncated, dtype=np.float32),
+                'occluded': np.array(occluded, dtype=np.int64),
+                'alpha': np.array(alpha, dtype=np.float32),
+                'bbox': np.array(bboxes, dtype=np.float32).reshape(-1, 4),
+                'dimensions': np.array(dimensions, dtype=np.float32).reshape(-1, 3),
+                'location': np.array(locations, dtype=np.float32).reshape(-1, 3),
+                'rotation_y': np.array(rotation_y, dtype=np.float32),
+            }
+            gt_annos.append(anno)
+
+        return gt_annos
+
+    def _format_results_kitti(self, outputs, jsonfile_prefix=None):
+        """Format the results to KITTI format for evaluation."""
+        from mmdet3d.core.bbox import Box3DMode
+
+        det_annos = []
+        print(f"Formatting {len(outputs)} results for KITTI...")
+
+        for i, out in enumerate(outputs):
+            info = self.data_infos[i]
+            frame = info['frame']
+            calib = self.tri3d_dataset._load_calib(frame)
+            lidar2cam = calib["R0_rect"] @ calib["Tr_velo_to_cam"]
+            p2 = calib["P2"]
+
+            if "pts_bbox" in out:
+                bboxes = out["pts_bbox"]["boxes_3d"]
+                scores = out["pts_bbox"]["scores_3d"]
+                labels = out["pts_bbox"]["labels_3d"]
+            else:
+                bboxes = out["boxes_3d"]
+                scores = out["scores_3d"]
+                labels = out["labels_3d"]
+
+            if bboxes.tensor.numel() == 0:
+                det_annos.append(
+                    dict(
+                        name=np.array([]),
+                        truncated=np.array([]),
+                        occluded=np.array([]),
+                        alpha=np.array([]),
+                        bbox=np.zeros([0, 4]),
+                        dimensions=np.zeros([0, 3]),
+                        location=np.zeros([0, 3]),
+                        rotation_y=np.array([]),
+                        score=np.array([]),
+                    )
+                )
+                continue
+
+            cam_boxes = bboxes.convert_to(Box3DMode.CAM, rt_mat=lidar2cam)
+            cam_boxes_np = cam_boxes.tensor.cpu().numpy()
+            lidar_boxes_np = bboxes.tensor.cpu().numpy()
+            scores = scores.cpu().numpy()
+            labels = labels.cpu().numpy()
+
+            names, truncated, occluded, alpha = [], [], [], []
+            bboxes2d, dimensions, locations, rotation_y, score_list = [], [], [], [], []
+
+            corners = cam_boxes.corners.cpu().numpy()
+            img_w, img_h = self.tri3d_dataset._get_image_size(frame, "IMG2")
+
+            for j in range(len(cam_boxes_np)):
+                cls_name = self.CLASSES[labels[j]]
+                kitti_cls = self.NUSC_TO_KITTI_MAPPING.get(cls_name)
+                if kitti_cls is None:
+                    continue
+
+                corners_h = np.concatenate(
+                    [corners[j], np.ones((8, 1), dtype=np.float32)], axis=1
+                )
+                proj = corners_h @ p2.T
+                proj[:, 0] /= np.clip(proj[:, 2], 1e-6, None)
+                proj[:, 1] /= np.clip(proj[:, 2], 1e-6, None)
+                x_min, y_min = proj[:, 0].min(), proj[:, 1].min()
+                x_max, y_max = proj[:, 0].max(), proj[:, 1].max()
+                x_min = float(np.clip(x_min, 0, img_w - 1))
+                y_min = float(np.clip(y_min, 0, img_h - 1))
+                x_max = float(np.clip(x_max, 0, img_w - 1))
+                y_max = float(np.clip(y_max, 0, img_h - 1))
+
+                names.append(kitti_cls)
+                truncated.append(0.0)
+                occluded.append(0)
+                rotation = float(cam_boxes_np[j, 6])
+                alpha_val = -np.arctan2(-lidar_boxes_np[j, 1], lidar_boxes_np[j, 0]) + rotation
+                alpha.append(float(alpha_val))
+                bboxes2d.append([x_min, y_min, x_max, y_max])
+                dimensions.append(cam_boxes_np[j, 3:6].tolist())
+                locations.append(cam_boxes_np[j, 0:3].tolist())
+                rotation_y.append(rotation)
+                score_list.append(float(scores[j]))
+
+            det_annos.append(
+                dict(
+                    name=np.array(names),
+                    truncated=np.array(truncated, dtype=np.float32),
+                    occluded=np.array(occluded, dtype=np.int64),
+                    alpha=np.array(alpha, dtype=np.float32),
+                    bbox=np.array(bboxes2d, dtype=np.float32).reshape(-1, 4),
+                    dimensions=np.array(dimensions, dtype=np.float32).reshape(-1, 3),
+                    location=np.array(locations, dtype=np.float32).reshape(-1, 3),
+                    rotation_y=np.array(rotation_y, dtype=np.float32),
+                    score=np.array(score_list, dtype=np.float32),
+                )
+            )
+
+        return det_annos
+
+    def _evaluate_kitti(self, results, logger=None, jsonfile_prefix=None, **kwargs):
+        """Evaluation in KITTI protocol."""
+        from mmdet3d.core.evaluation import kitti_eval
+
+        print(f"Evaluating {len(results)} results (KITTI)...")
+        det_annos = self._format_results_kitti(results, jsonfile_prefix)
+        gt_annos = self._load_kitti_gts()
+
+        ap_result_str, ap_dict = kitti_eval(
+            gt_annos,
+            det_annos,
+            ['Car', 'Pedestrian', 'Cyclist'],
+            eval_types=['bbox', 'bev', '3d'],
+        )
+        print(ap_result_str)
+
+        detail = {}
+        for ap_type, ap in ap_dict.items():
+            detail[f'pts_bbox_KITTI/{ap_type}'] = float('{:.4f}'.format(ap))
 
         return detail
     # ==================== Argoverse2 Evaluation Methods ====================
