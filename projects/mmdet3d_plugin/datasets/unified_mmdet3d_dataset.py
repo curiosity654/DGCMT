@@ -136,8 +136,10 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
                  test_mode=False, 
                  file_client_args=dict(backend='disk'),
                  cat_mapping=None,
+                 load_interval=1,
                  **kwargs):
         # 1. Initialize Tri3D dataset
+
         self.dataset_type_name = dataset_type  # Save for branching in evaluate/format
         self.tri3d_cls = getattr(tri3d_datasets, dataset_type)
         
@@ -167,6 +169,7 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
         self.test_mode = test_mode
         self.modality = modality
         self.filter_empty_gt = filter_empty_gt
+        self.load_interval = load_interval
         self.box_type_3d, self.box_mode_3d = get_box_type(box_type_3d)
 
         self.CLASSES = self.get_classes(classes)
@@ -206,6 +209,7 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
 
         print(f"Indexing {len(sequences)} sequences from {self.tri3d_dataset.__class__.__name__}...")
         
+        indexed_frames = []
         for seq in tqdm(sequences, desc="Indexing sequences"):
             try:
                 frames = self.tri3d_dataset.keyframes(seq, sensor)
@@ -213,52 +217,71 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
             except (AttributeError, NotImplementedError):
                 frames = self.tri3d_dataset.frames(seq, sensor)
                 is_keyframes = False
-                
-            for i, frame in enumerate(frames):
-                cat_ids = []
-                
-                # Only compute cat_ids for training (used by CBGS and empty frame filtering)
-                if not self.test_mode:
-                    boxes = self.tri3d_dataset.boxes(seq, frame, coords=sensor)
-                    for box in boxes:
-                        mapped_label = self._map_label(box.label)
-                        if mapped_label and mapped_label in self.CLASSES:
-                            cat_ids.append(self.CLASSES.index(mapped_label))
-                    
-                    # Skip empty frames in training
-                    if self.filter_empty_gt and len(cat_ids) == 0:
-                        continue
 
-                # Build data_info dict with dataset-specific fields
-                data_info = dict(
-                    seq=seq,
-                    frame=frame,
-                    sensor=sensor,
-                    sample_idx=f"{seq}_{frame}",
-                    cat_ids=list(set(cat_ids))
+            for frame_idx, frame in enumerate(frames):
+                indexed_frames.append(
+                    dict(
+                        seq=seq,
+                        frame=frame,
+                        frame_idx=frame_idx,
+                        is_keyframes=is_keyframes,
+                    )
                 )
 
-                # NuScenes-specific: Get sample token for evaluation
-                if self.dataset_type_name == 'NuScenes':
-                    token = None
-                    if hasattr(self.tri3d_dataset.obj, 'scenes'):
-                        try:
-                            if is_keyframes:
-                                token = self.tri3d_dataset.obj.scenes[seq].sample_tokens[i]
-                        except (AttributeError, IndexError):
-                            pass
-                    data_info['token'] = token
+        indexed_frames = indexed_frames[::self.load_interval]
 
-                # Argoverse2-specific: Get log_id and timestamp_ns for evaluation
-                elif self.dataset_type_name == 'Argoverse2':
-                    # log_id is the sequence directory name
-                    log_id = self.tri3d_dataset.records[seq].name
-                    # timestamp_ns from tri3d timeline
-                    timestamp_ns = int(self.tri3d_dataset.timestamps(seq, sensor)[frame])
-                    data_info['log_id'] = log_id
-                    data_info['timestamp_ns'] = timestamp_ns
+        for item in indexed_frames:
+            seq = item["seq"]
+            frame = item["frame"]
+            frame_idx = item["frame_idx"]
+            is_keyframes = item["is_keyframes"]
+            cat_ids = []
 
-                data_infos.append(data_info)
+            # Only compute cat_ids for training (used by CBGS and empty frame filtering)
+            if not self.test_mode:
+                boxes = self.tri3d_dataset.boxes(seq, frame, coords=sensor)
+                for box in boxes:
+                    mapped_label = self._map_label(box.label)
+                    if mapped_label and mapped_label in self.CLASSES:
+                        cat_ids.append(self.CLASSES.index(mapped_label))
+
+                # Skip empty frames in training
+                if self.filter_empty_gt and len(cat_ids) == 0:
+                    continue
+
+            # Build data_info dict with dataset-specific fields
+            data_info = dict(
+                seq=seq,
+                frame=frame,
+                sensor=sensor,
+                sample_idx=f"{seq}_{frame}",
+                cat_ids=list(set(cat_ids))
+            )
+
+            # NuScenes-specific: Get sample token for evaluation
+            if self.dataset_type_name == 'NuScenes':
+                token = None
+                if is_keyframes:
+                    try:
+                        token = self.tri3d_dataset.sample_tokens(seq)[frame_idx]
+                    except Exception:
+                        if hasattr(self.tri3d_dataset.obj, 'scenes'):
+                            try:
+                                token = self.tri3d_dataset.obj.scenes[seq].sample_tokens[frame_idx]
+                            except (AttributeError, IndexError):
+                                pass
+                data_info['token'] = token
+
+            # Argoverse2-specific: Get log_id and timestamp_ns for evaluation
+            elif self.dataset_type_name == 'Argoverse2':
+                # log_id is the sequence directory name
+                log_id = self.tri3d_dataset.records[seq].name
+                # timestamp_ns from tri3d timeline
+                timestamp_ns = int(self.tri3d_dataset.timestamps(seq, sensor)[frame])
+                data_info['log_id'] = log_id
+                data_info['timestamp_ns'] = timestamp_ns
+
+            data_infos.append(data_info)
         
         print(f"Loaded {len(data_infos)} frames (filtered: {self.filter_empty_gt})")
         return data_infos
@@ -331,7 +354,7 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
             # The model was trained on native NuScenes LIDAR frame (via LoadPointsFromTri3D)
             # native_LIDAR = Rot(-90) @ Tri3D_LIDAR  => Tri3D_LIDAR = Rot(90) @ native_LIDAR
             # So native_LIDAR to World = Tri3D_LIDAR to World @ Rot(90)
-            native2tri3d = RigidTransform(Rotation.from_euler("Z", np.pi / 2), [0, 0, 0])
+            native2tri3d = RigidTransform(Rotation.from_euler("Z", -np.pi / 2), [0, 0, 0])
             native2world = sensor2world @ native2tri3d
         else:
             native2world = None
@@ -340,11 +363,12 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
             # LiDARInstance3DBoxes for NuScenes: [x, y, z, l, w, h, yaw, vx, vy]
             # NuScenes expects: [x, y, z] for translation, [w, l, h] for size
             x, y, z, l, w, h, yaw = bboxes_tensor[i, :7]
+            z_center = z + h / 2.0
 
             if native2world is not None:
                 # Create box to native LIDAR transform
-                # Translation is [x, y, z], Rotation is around Z
-                box2native = RigidTransform(Rotation.from_euler("Z", yaw), [x, y, z])
+                # Translation is gravity center [x, y, z_center]
+                box2native = RigidTransform(Rotation.from_euler("Z", yaw), [x, y, z_center])
 
                 # Box to world
                 box2world = native2world @ box2native
