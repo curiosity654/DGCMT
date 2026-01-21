@@ -463,12 +463,80 @@ def build_data_from_dump(dump: dict, device: torch.device):
     return data
 
 def _bev_poly_from_corners(corners_xyz: np.ndarray) -> np.ndarray:
-    """Return BEV polygon (4 points) from 3D 8 corners: take XY of bottom face 0..3."""
+    """Return BEV polygon from 3D corners using convex hull."""
     if corners_xyz.shape[0] != 8:
         return None
-    # Assuming corners ordering matches bottom 0..3, top 4..7
-    poly = corners_xyz[:4, :2].astype(np.float32)
-    return poly
+    pts = corners_xyz[:, :2].astype(np.float32)
+    hull = cv2.convexHull(pts)
+    if hull is None:
+        return None
+    return hull.reshape(-1, 2)
+
+
+def draw_bev_boxes(
+    pred_corners,
+    pred_labels,
+    color_map,
+    out_path,
+    gt_corners=None,
+    gt_color=(255, 255, 255),
+    bev_range=None,
+):
+    all_polys = []
+    for corners in pred_corners:
+        poly = _bev_poly_from_corners(corners)
+        if poly is not None:
+            all_polys.append(poly)
+    if gt_corners is not None:
+        for corners in gt_corners:
+            poly = _bev_poly_from_corners(corners)
+            if poly is not None:
+                all_polys.append(poly)
+
+    if not all_polys:
+        print(f'No BEV polygons to draw: {out_path}')
+        return
+
+    if bev_range is not None:
+        min_xy = np.array([bev_range[0], bev_range[1]], dtype=np.float32)
+        max_xy = np.array([bev_range[2], bev_range[3]], dtype=np.float32)
+    else:
+        all_pts = np.vstack(all_polys)
+        min_xy = all_pts.min(axis=0)
+        max_xy = all_pts.max(axis=0)
+
+    span = np.maximum(max_xy - min_xy, 1.0)
+    scale = 800.0 / max(span[0], span[1])
+    padding = 40.0
+
+    w = int(span[0] * scale + padding * 2)
+    h = int(span[1] * scale + padding * 2)
+    canvas = np.zeros((h, w, 3), dtype=np.uint8)
+
+    def to_img(poly):
+        pts = (poly - min_xy) * scale
+        pts[:, 0] += padding
+        pts[:, 1] += padding
+        pts[:, 1] = h - pts[:, 1]
+        return pts.astype(np.int32)
+
+    # Draw GT first
+    if gt_corners is not None:
+        for corners in gt_corners:
+            poly = _bev_poly_from_corners(corners)
+            if poly is None:
+                continue
+            cv2.polylines(canvas, [to_img(poly)], True, gt_color, 2)
+
+    # Draw predictions
+    for corners, label in zip(pred_corners, pred_labels):
+        poly = _bev_poly_from_corners(corners)
+        if poly is None:
+            continue
+        color = color_map.get(int(label), (0, 0, 255))
+        cv2.polylines(canvas, [to_img(poly)], True, color, 2)
+
+    cv2.imwrite(out_path, canvas)
 
 def _poly_iou_bev(poly1: np.ndarray, poly2: np.ndarray) -> float:
     """Compute polygon IoU on BEV by rasterization (robust, dependency-free)."""
@@ -549,7 +617,11 @@ def main():
     parser.add_argument('--out-dir', type=str, default='vis_output/infer_from_pkl')
     parser.add_argument('--iou-thr', type=float, default=0.5, help='IoU threshold for single-scene BEV evaluation')
     parser.add_argument('--score-thr', type=float, default=0.0, help='Score threshold for visualization (filter boxes with score < threshold)')
+    parser.add_argument('--show-gt', action='store_true', help='Overlay GT boxes if present in dump')
+    parser.add_argument('--gt-color', type=str, default='255,255,255', help='GT box color as B,G,R')
+    parser.add_argument('--bev-range', type=str, default='-54,-54,54,54', help='BEV range xmin,ymin,xmax,ymax')
     args = parser.parse_args()
+
 
     # Load dump
     with open(args.pkl, 'rb') as f:
@@ -586,6 +658,18 @@ def main():
     num_views = img_tensors.shape[0]
     lidar2img_matrices = data['img_metas'][0][0]['lidar2img']
 
+    # Load GT if available
+    gt_boxes_np = dump.get('gt_bboxes_3d')
+    gt_labels_np = dump.get('gt_labels_3d')
+    gt_box_obj = None
+    if args.show_gt and gt_boxes_np is not None and gt_labels_np is not None:
+        try:
+            gt_tensor = torch.tensor(gt_boxes_np, dtype=torch.float32)
+            gt_box_obj = LiDARInstance3DBoxes(gt_tensor, box_dim=gt_tensor.shape[1])
+        except Exception as e:
+            print(f'Failed to build GT boxes: {e}')
+            gt_box_obj = None
+
     # debug_attention_maps(output_dir, img_tensors, img_norm_cfg)
 
     results = results[0]['pts_bbox']
@@ -611,11 +695,45 @@ def main():
         color_map,
         filename=os.path.join(output_dir, 'pred_point_cloud_with_boxes.ply')
     )
+    if args.show_gt and gt_box_obj is not None:
+        export_point_cloud_with_boxes(
+            points_np[:, :3],
+            points_np[:, 3] if points_np.shape[1] > 3 else None,
+            gt_box_obj,
+            torch.tensor(gt_labels_np),
+            color_map,
+            filename=os.path.join(output_dir, 'gt_point_cloud_with_boxes.ply')
+        )
 
     # Per-view 2D visualization
     img_tensors = data['img'][0]
     num_views = img_tensors.shape[0]
     lidar2img_matrices = data['img_metas'][0][0]['lidar2img']
+
+    # BEV visualization
+    try:
+        pred_corners = pred_bboxes.corners.detach().cpu().numpy()
+        pred_labels_np = pred_labels.detach().cpu().numpy() if hasattr(pred_labels, 'detach') else np.array(pred_labels)
+        gt_corners_bev = None
+        gt_color = tuple(int(c) for c in args.gt_color.split(','))
+        if args.show_gt and gt_box_obj is not None:
+            gt_corners_bev = gt_box_obj.corners.detach().cpu().numpy()
+        bev_range = [float(v) for v in args.bev_range.split(',')]
+        if len(bev_range) != 4:
+            raise ValueError('bev-range must be xmin,ymin,xmax,ymax')
+        bev_path = os.path.join(output_dir, 'bev_boxes.png')
+        draw_bev_boxes(
+            pred_corners,
+            pred_labels_np,
+            color_map,
+            bev_path,
+            gt_corners=gt_corners_bev,
+            gt_color=gt_color,
+            bev_range=bev_range,
+        )
+        print(f'Saved BEV visualization to {bev_path}')
+    except Exception as e:
+        print(f'Failed to draw BEV boxes: {e}')
 
     for view_id in range(num_views):
         img_tensor = img_tensors[view_id]
@@ -635,21 +753,21 @@ def main():
         img = img * std + mean
         img = np.clip(img, 0, 255).astype(np.uint8)
 
-        # 智能裁剪：检查是否有 padding
-        # 如果 img_shape > ori_shape，说明图片被 pad 了，需要裁剪回 ori_shape
-        img_metas_dict = data['img_metas'][0][0]
-        if 'ori_shape' in img_metas_dict and 'img_shape' in img_metas_dict:
-            ori_shapes = img_metas_dict['ori_shape']
-            img_shapes = img_metas_dict['img_shape']
-            if isinstance(ori_shapes, (list, tuple)) and isinstance(img_shapes, (list, tuple)):
-                if view_id < len(ori_shapes) and view_id < len(img_shapes):
-                    ori_h, ori_w = ori_shapes[view_id][:2]
-                    img_h, img_w = img_shapes[view_id][:2]
-                    curr_h, curr_w = img.shape[:2]
-                    # 如果 img_shape > ori_shape（有padding），裁剪到 ori_shape
-                    if img_h > ori_h or img_w > ori_w:
-                        # 裁剪到原始尺寸
-                        img = img[:ori_h, :ori_w]
+        # # 智能裁剪：检查是否有 padding
+        # # 如果 img_shape > ori_shape，说明图片被 pad 了，需要裁剪回 ori_shape
+        # img_metas_dict = data['img_metas'][0][0]
+        # if 'ori_shape' in img_metas_dict and 'img_shape' in img_metas_dict:
+        #     ori_shapes = img_metas_dict['ori_shape']
+        #     img_shapes = img_metas_dict['img_shape']
+        #     if isinstance(ori_shapes, (list, tuple)) and isinstance(img_shapes, (list, tuple)):
+        #         if view_id < len(ori_shapes) and view_id < len(img_shapes):
+        #             ori_h, ori_w = ori_shapes[view_id][:2]
+        #             img_h, img_w = img_shapes[view_id][:2]
+        #             curr_h, curr_w = img.shape[:2]
+        #             # 如果 img_shape > ori_shape（有padding），裁剪到 ori_shape
+        #             if img_h > ori_h or img_w > ori_w:
+        #                 # 裁剪到原始尺寸
+        #                 img = img[:ori_h, :ori_w]
 
         vis_img = img.copy()
 
@@ -670,6 +788,19 @@ def main():
                 text = f'{score:.2f}'
                 text_pos = tuple(map(int, corners_2d.mean(axis=0)))
                 cv2.putText(vis_img, text, text_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+        if args.show_gt and gt_box_obj is not None:
+            try:
+                gt_corners = gt_box_obj.corners.detach().cpu().numpy()
+                gt_color = tuple(int(c) for c in args.gt_color.split(','))
+                for corners in gt_corners:
+                    corners_hom = np.concatenate([corners, np.ones((8, 1))], axis=1)
+                    corners_2d_hom = corners_hom @ np.array(lidar2img).T
+                    if np.all(corners_2d_hom[:, 2] > 0):
+                        corners_2d = corners_2d_hom[:, :2] / corners_2d_hom[:, 2:3]
+                        draw_3d_box_projection(vis_img, corners_2d, color=gt_color, thickness=2)
+            except Exception as e:
+                print(f'Failed to draw GT boxes: {e}')
 
         out_path = os.path.join(output_dir, f'vis_view_{view_id}.png')
         cv2.imwrite(out_path, vis_img)

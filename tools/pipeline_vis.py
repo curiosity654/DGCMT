@@ -151,10 +151,11 @@ def build_dump_from_results(results: Dict[str, Any], extra_meta: Dict[str, Any])
         if opt_k in results:
             dump[opt_k] = to_numpy(extract_result(results[opt_k]))
 
-    # 3D GT for single-scene evaluation
+    # 3D GT for single-scene evaluation and visualization
     if 'gt_bboxes_3d' in results:
         gt_bboxes_3d = extract_result(results['gt_bboxes_3d'])
         try:
+            dump['gt_bboxes_3d'] = to_numpy(gt_bboxes_3d.tensor)
             corners = gt_bboxes_3d.corners  # (M, 8, 3)
             dump['gt_bboxes_3d_corners'] = to_numpy(corners)
         except Exception:
@@ -427,7 +428,20 @@ def main():
                         # 确保坐标是有限的且可以转换为整数
                         if not np.all(np.isfinite(pts_2d)):
                             continue
+                        
+                        # 在每个角点旁边标注索引号（用于调试）
+                        for corner_idx in range(8):
+                            pt = pts_2d[corner_idx]
+                            pt_int = (int(pt[0]), int(pt[1]))
+                            # 绘制角点索引号（白色文字，黑色背景）
+                            cv2.putText(img, str(corner_idx), pt_int, 
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3)
+                            cv2.putText(img, str(corner_idx), pt_int, 
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
                             
+                        # 前脸的四条边（4-5-6-7 面，箭头指向的面）
+                        front_face_edges = [[4, 5], [5, 6], [6, 7], [7, 4]]
+                        
                         edges = [
                             [0, 1], [1, 2], [2, 3], [3, 0],
                             [4, 5], [5, 6], [6, 7], [7, 4],
@@ -441,7 +455,9 @@ def main():
                             pt1 = (int(p1[0]), int(p1[1]))
                             pt2 = (int(p2[0]), int(p2[1]))
                             
-                            cv2.line(img, pt1, pt2, color, 2)
+                            # 前脸使用白色，其他边使用类别颜色
+                            edge_color = (255, 255, 255) if edge in front_face_edges else color
+                            cv2.line(img, pt1, pt2, edge_color, 2)
                         
                         # 绘制朝向箭头
                         if args.show_orientation:
