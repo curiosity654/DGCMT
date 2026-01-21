@@ -129,6 +129,7 @@ test_pipeline = [
     #     use_dim=[0, 1, 2, 3, 4],
     # ),
     dict(type='LoadMultiViewImageFromTri3D'),
+    dict(type='PointsRangeFilter', point_cloud_range=point_cloud_range),
     dict(
         type='MultiScaleFlipAug3D',
         img_scale=(1333, 800),

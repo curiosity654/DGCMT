@@ -480,21 +480,30 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
         
         # Determine evaluation set
         eval_set = 'val'
+        custom_scenes = None
         if self.tri3d_dataset.obj.subset == 'v1.0-mini':
             eval_set = 'mini_val'
         elif hasattr(self.tri3d_dataset.obj, 'split'):
-            if self.tri3d_dataset.obj.split in ['train', 'val', 'test']:
-                eval_set = self.tri3d_dataset.obj.split
-            elif self.tri3d_dataset.obj.split == 'val_mini':
+            split = self.tri3d_dataset.obj.split
+            if isinstance(split, (list, tuple, set)):
+                custom_scenes = list(split)
+                eval_set = 'val'
+            elif split in ['train', 'val', 'test']:
+                eval_set = split
+            elif split == 'val_mini':
                 # Map our custom val_mini to 'val' split for SDK to load annotations
                 eval_set = 'val'
 
         from nuscenes.nuscenes import NuScenes
-        from nuscenes.eval.detection.evaluate import DetectionEval
+        from nuscenes.eval.detection.evaluate import DetectionEval, remove_extra_samples
         from nuscenes.eval.detection.config import config_factory
+        from nuscenes.eval.common.loaders import load_gt
         
         nusc = NuScenes(version=self.tri3d_dataset.obj.subset, dataroot=self.data_root, verbose=False)
         cfg = config_factory('detection_cvpr_2019')
+        if hasattr(self, 'CLASSES') and self.CLASSES is not None:
+            cfg.class_names = list(self.CLASSES)
+            cfg.class_range = {k: v for k, v in cfg.class_range.items() if k in cfg.class_names}
         
         nusc_eval = DetectionEval(
             nusc,
@@ -502,15 +511,19 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
             result_path=f"{jsonfile_prefix}.submission.json",
             eval_set=eval_set,
             output_dir=osp.dirname(jsonfile_prefix),
-            verbose=True
+            verbose=True,
+            custom_scenes=custom_scenes,
         )
         
         # If we are using a custom split, force the SDK to only evaluate on those tokens
-        if self.tri3d_dataset.obj.split == 'val_mini':
+        if custom_scenes is not None:
+            nusc_eval.sample_tokens = list(nusc_eval.gt_boxes.sample_tokens)
+            print(f"Forcing evaluation on {len(nusc_eval.sample_tokens)} custom split samples")
+        elif self.tri3d_dataset.obj.split == 'val_mini':
             nusc_eval.sample_tokens = list(nusc_annos.keys())
             print(f"Forcing evaluation on {len(nusc_eval.sample_tokens)} mini split samples")
 
-        nusc_eval.main(plot_examples=0)
+        nusc_eval.main(plot_examples=0, render_curves=False)
         
         # Load metrics from the saved JSON file (this ensures proper serialization)
         metrics = mmcv.load(osp.join(osp.dirname(jsonfile_prefix), 'metrics_summary.json'))
