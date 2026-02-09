@@ -1,3 +1,5 @@
+import hashlib
+import json
 import numpy as np
 import mmcv
 import os.path as osp
@@ -13,6 +15,87 @@ import tri3d.datasets as tri3d_datasets
 from pyquaternion import Quaternion
 from tri3d.geometry import RigidTransform, Rotation
 from tqdm import tqdm
+
+try:
+    from numba import njit
+except Exception:  # noqa: BLE001
+    njit = None
+
+
+if njit is not None:
+    @njit(cache=True)
+    def _simbev_match_numba(pred_centers, gt_centers, threshold):
+        """Greedy nearest-neighbor matching for one class/threshold."""
+        num_pred = pred_centers.shape[0]
+        num_gt = gt_centers.shape[0]
+
+        tp = np.zeros(num_pred, dtype=np.float32)
+        fp = np.zeros(num_pred, dtype=np.float32)
+        matched_gt_idx = np.full(num_pred, -1, dtype=np.int64)
+        min_dists = np.full(num_pred, np.nan, dtype=np.float32)
+
+        if num_gt == 0:
+            for i in range(num_pred):
+                fp[i] = 1.0
+            return tp, fp, matched_gt_idx, min_dists
+
+        assigned = np.zeros(num_gt, dtype=np.uint8)
+        for i in range(num_pred):
+            best_idx = -1
+            best_dist = 1e20
+            px = pred_centers[i, 0]
+            py = pred_centers[i, 1]
+            pz = pred_centers[i, 2]
+            for j in range(num_gt):
+                if assigned[j] != 0:
+                    continue
+                dx = gt_centers[j, 0] - px
+                dy = gt_centers[j, 1] - py
+                dz = gt_centers[j, 2] - pz
+                d = (dx * dx + dy * dy + dz * dz) ** 0.5
+                if d < best_dist:
+                    best_dist = d
+                    best_idx = j
+
+            if best_idx >= 0 and best_dist <= threshold:
+                tp[i] = 1.0
+                assigned[best_idx] = 1
+                matched_gt_idx[i] = best_idx
+                min_dists[i] = best_dist
+            else:
+                fp[i] = 1.0
+
+        return tp, fp, matched_gt_idx, min_dists
+else:
+    def _simbev_match_numba(pred_centers, gt_centers, threshold):
+        """Python fallback if numba is unavailable."""
+        num_pred = pred_centers.shape[0]
+        num_gt = gt_centers.shape[0]
+
+        tp = np.zeros(num_pred, dtype=np.float32)
+        fp = np.zeros(num_pred, dtype=np.float32)
+        matched_gt_idx = np.full(num_pred, -1, dtype=np.int64)
+        min_dists = np.full(num_pred, np.nan, dtype=np.float32)
+
+        if num_gt == 0:
+            fp[:] = 1.0
+            return tp, fp, matched_gt_idx, min_dists
+
+        assigned = np.zeros(num_gt, dtype=bool)
+        for i in range(num_pred):
+            dists = np.linalg.norm(gt_centers - pred_centers[i], axis=1)
+            dists[assigned] = np.inf
+            j = int(np.argmin(dists))
+            d = float(dists[j])
+            if np.isfinite(d) and d <= threshold:
+                tp[i] = 1.0
+                assigned[j] = True
+                matched_gt_idx[i] = j
+                min_dists[i] = d
+            else:
+                fp[i] = 1.0
+
+        return tp, fp, matched_gt_idx, min_dists
 
 class Tri3DObjectWrapper:
     """A wrapper to prevent deepcopy of the large Tri3D dataset object.
@@ -37,6 +120,7 @@ class Tri3DObjectWrapper:
 
 @DATASETS.register_module()
 class UnifiedMMDet3DDataset(Custom3DDataset):
+    CACHE_VERSION = 1
     
     # Default NuScenes mapping using prefixes to support hierarchical labels
     # e.g., 'vehicle.bus.rigid' will match 'vehicle.bus'
@@ -97,6 +181,18 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
         'traffic_cone': 'CONSTRUCTION_CONE',
     }
 
+    # SimBEV label mapping to NuScenes 10 classes
+    SIMBEV_MAPPING = {
+        'car': 'car',
+        'truck': 'truck',
+        'bus': 'bus',
+        'motorcycle': 'motorcycle',
+        'bicycle': 'bicycle',
+        'pedestrian': 'pedestrian',
+        'van': 'car',  # Map van to car
+        'trailer': 'trailer',
+    }
+
     # nuScenes official attributes mapping
     ATTR_TABLE = [
         "cycle.with_rider",
@@ -137,6 +233,9 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
                  file_client_args=dict(backend='disk'),
                  cat_mapping=None,
                  load_interval=1,
+                 use_cache=True,
+                 cache_dir=None,
+                 cache_refresh=False,
                  **kwargs):
         # 1. Initialize Tri3D dataset
 
@@ -160,16 +259,23 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
             self.cat_mapping = self.NUSC_MAPPING
         elif dataset_type == 'Argoverse2':
             self.cat_mapping = self.ARGO2_MAPPING
+        elif dataset_type == 'SimBEV':
+            self.cat_mapping = self.SIMBEV_MAPPING
         else:
             self.cat_mapping = {}
 
         # 2. Initialize standard Dataset attributes (mimicking Custom3DDataset)
         self.data_root = data_root
+        self.subset = subset
+        self.split = split
         self.ann_file = None 
         self.test_mode = test_mode
         self.modality = modality
         self.filter_empty_gt = filter_empty_gt
         self.load_interval = load_interval
+        self.use_cache = use_cache
+        self.cache_dir = cache_dir
+        self.cache_refresh = cache_refresh
         self.box_type_3d, self.box_mode_3d = get_box_type(box_type_3d)
 
         self.CLASSES = self.get_classes(classes)
@@ -194,6 +300,32 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
                 return v
         return None
 
+    def _get_cache_meta(self, sensor):
+        return {
+            'cache_version': self.CACHE_VERSION,
+            'dataset_type': self.dataset_type_name,
+            'tri3d_cls': self.tri3d_cls.__name__,
+            'subset': self.subset,
+            'split': self.split,
+            'sensor': sensor,
+            'test_mode': self.test_mode,
+            'filter_empty_gt': self.filter_empty_gt,
+            'load_interval': self.load_interval,
+            'classes': list(self.CLASSES),
+            'cat_mapping': dict(self.cat_mapping),
+        }
+
+    def _get_cache_path(self, sensor):
+        base_dir = self.cache_dir or osp.join(self.data_root, '.cache', 'unified_mmdet3d')
+        Path(base_dir).mkdir(parents=True, exist_ok=True)
+        meta = self._get_cache_meta(sensor)
+        meta_str = json.dumps(meta, sort_keys=True, ensure_ascii=True)
+        meta_hash = hashlib.md5(meta_str.encode('utf-8')).hexdigest()
+        split_tag = self.split or 'nosplit'
+        subset_tag = self.subset or 'nosubset'
+        filename = f"{self.dataset_type_name}_{subset_tag}_{split_tag}_{meta_hash}.pkl"
+        return osp.join(base_dir, filename), meta
+
     def load_annotations(self, ann_file):
         """Rebuild data index from Tri3D."""
         data_infos = []
@@ -201,6 +333,16 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
             sensor = self.tri3d_dataset.pcl_sensors[0]
         else:
             raise ValueError("Dataset must have point cloud sensors")
+
+        cache_path = None
+        cache_meta = None
+        if self.use_cache:
+            cache_path, cache_meta = self._get_cache_path(sensor)
+            if not self.cache_refresh and osp.exists(cache_path):
+                cached = mmcv.load(cache_path)
+                if cached.get('meta') == cache_meta and 'data_infos' in cached:
+                    print(f"Loaded cached data_infos from {cache_path}")
+                    return cached['data_infos']
 
         try:
             sequences = self.tri3d_dataset.sequences()
@@ -230,7 +372,7 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
 
         indexed_frames = indexed_frames[::self.load_interval]
 
-        for item in indexed_frames:
+        for item in tqdm(indexed_frames, desc="Building data infos"):
             seq = item["seq"]
             frame = item["frame"]
             frame_idx = item["frame_idx"]
@@ -284,6 +426,9 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
             data_infos.append(data_info)
         
         print(f"Loaded {len(data_infos)} frames (filtered: {self.filter_empty_gt})")
+        if self.use_cache and cache_path is not None:
+            mmcv.dump({'meta': cache_meta, 'data_infos': data_infos}, cache_path)
+            print(f"Saved data_infos cache to {cache_path}")
         return data_infos
 
     def get_data_info(self, index):
@@ -462,8 +607,432 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
         """Evaluation based on dataset type."""
         if self.dataset_type_name == 'Argoverse2':
             return self._evaluate_av2(results, logger, jsonfile_prefix, **kwargs)
+        elif self.dataset_type_name == 'SimBEV':
+            return self._evaluate_simbev(results, logger, jsonfile_prefix, **kwargs)
         else:
             return self._evaluate_nusc(results, logger, jsonfile_prefix, **kwargs)
+
+    def _extract_pred_arrays(self, result):
+        """Extract prediction arrays from model output for a single sample."""
+        if "pts_bbox" in result:
+            pred = result["pts_bbox"]
+        else:
+            pred = result
+
+        boxes_3d = pred["boxes_3d"]
+        scores_3d = pred["scores_3d"]
+        labels_3d = pred["labels_3d"]
+
+        boxes = boxes_3d.tensor.detach().cpu().numpy()
+        scores = scores_3d.detach().cpu().numpy()
+        labels = labels_3d.detach().cpu().numpy().astype(np.int64)
+
+        centers = boxes[:, :3] if boxes.shape[0] > 0 else np.zeros((0, 3), dtype=np.float32)
+        yaws = boxes[:, 6] if boxes.shape[0] > 0 else np.zeros((0,), dtype=np.float32)
+        sizes = boxes[:, 3:6] if boxes.shape[0] > 0 else np.zeros((0, 3), dtype=np.float32)
+        if boxes.shape[1] >= 9:
+            velocities = boxes[:, 7:9]
+        else:
+            velocities = None
+
+        return {
+            "centers": centers,
+            "yaws": yaws,
+            "sizes": sizes,
+            "velocities": velocities,
+            "scores": scores,
+            "labels": labels,
+        }
+
+    def _extract_gt_arrays(self, seq, frame, sensor):
+        """Extract GT arrays from Tri3D boxes for a single sample."""
+        boxes = self.tri3d_dataset.boxes(seq, frame, coords=sensor)
+
+        gt_centers = []
+        gt_yaws = []
+        gt_sizes = []
+        gt_velocities = []
+        gt_label_ids = []
+
+        for box in boxes:
+            mapped_label = self._map_label(box.label)
+            if mapped_label is None or mapped_label not in self.CLASSES:
+                continue
+
+            cls_id = self.CLASSES.index(mapped_label)
+            gt_label_ids.append(cls_id)
+            gt_centers.append(np.asarray(box.center, dtype=np.float32))
+            gt_yaws.append(float(box.heading))
+            gt_sizes.append(np.asarray(box.size, dtype=np.float32))
+
+            vel = getattr(box, "velocity", None)
+            if vel is None:
+                gt_velocities.append(np.array([np.nan, np.nan], dtype=np.float32))
+            else:
+                vel = np.asarray(vel, dtype=np.float32)
+                if vel.shape[0] >= 2:
+                    gt_velocities.append(vel[:2])
+                else:
+                    gt_velocities.append(np.array([np.nan, np.nan], dtype=np.float32))
+
+        if len(gt_label_ids) == 0:
+            return {
+                "centers": np.zeros((0, 3), dtype=np.float32),
+                "yaws": np.zeros((0,), dtype=np.float32),
+                "sizes": np.zeros((0, 3), dtype=np.float32),
+                "velocities": np.zeros((0, 2), dtype=np.float32),
+                "labels": np.zeros((0,), dtype=np.int64),
+            }
+
+        return {
+            "centers": np.stack(gt_centers, axis=0),
+            "yaws": np.asarray(gt_yaws, dtype=np.float32),
+            "sizes": np.stack(gt_sizes, axis=0),
+            "velocities": np.stack(gt_velocities, axis=0),
+            "labels": np.asarray(gt_label_ids, dtype=np.int64),
+        }
+
+    @staticmethod
+    def _yaw_abs_diff(yaw_a, yaw_b):
+        """Absolute wrapped yaw difference in radians."""
+        diff = (yaw_a - yaw_b + np.pi) % (2 * np.pi) - np.pi
+        return float(np.abs(diff))
+
+    @staticmethod
+    def _safe_nanmean(vals):
+        if len(vals) == 0:
+            return np.nan
+        arr = np.asarray(vals, dtype=np.float32)
+        arr = arr[np.isfinite(arr)]
+        if arr.size == 0:
+            return np.nan
+        return float(np.mean(arr))
+
+    @staticmethod
+    def _safe_nanmax(vals):
+        if len(vals) == 0:
+            return np.nan
+        arr = np.asarray(vals, dtype=np.float32)
+        arr = arr[np.isfinite(arr)]
+        if arr.size == 0:
+            return np.nan
+        return float(np.max(arr))
+
+    def _init_simbev_metrics_store(self, thresholds):
+        return {
+            thr: {
+                cls_id: {
+                    "scores": [],
+                    "tp": [],
+                    "fp": [],
+                    "ate": [],
+                    "aoe": [],
+                    "ase": [],
+                    "ave": [],
+                    "num_gt": 0,
+                }
+                for cls_id in range(len(self.CLASSES))
+            }
+            for thr in thresholds
+        }
+
+    def _finalize_simbev_metrics(self, metrics_store, thresholds, metric_prefix):
+        """Aggregate per-sample matching stats into final scalar metrics."""
+        detail = {}
+        ap_cls_means = []
+        ate_cls_means = []
+        aoe_cls_means = []
+        ase_cls_means = []
+        ave_cls_means = []
+
+        for cls_id, cls_name in enumerate(self.CLASSES):
+            class_ap_vals = []
+            class_ate_vals = []
+            class_aoe_vals = []
+            class_ase_vals = []
+            class_ave_vals = []
+
+            for thr in thresholds:
+                cls_store = metrics_store[thr][cls_id]
+                thr_str = f"{thr:.1f}"
+
+                scores = np.asarray(cls_store["scores"], dtype=np.float32)
+                tp = np.asarray(cls_store["tp"], dtype=np.float32)
+                fp = np.asarray(cls_store["fp"], dtype=np.float32)
+                num_gt = int(cls_store["num_gt"])
+
+                if scores.shape[0] > 0:
+                    order = np.argsort(-scores)
+                    tp = tp[order]
+                    fp = fp[order]
+                    tp_cum = np.cumsum(tp)
+                    fp_cum = np.cumsum(fp)
+                else:
+                    tp_cum = np.zeros((0,), dtype=np.float32)
+                    fp_cum = np.zeros((0,), dtype=np.float32)
+
+                if num_gt > 0:
+                    recalls = tp_cum / max(num_gt, 1)
+                    precisions = tp_cum / np.maximum(tp_cum + fp_cum, 1e-6)
+                    recalls = np.concatenate(([0.0], recalls))
+                    precisions = np.concatenate(([1.0], precisions))
+                    ap = float(np.trapz(precisions, recalls))
+                else:
+                    ap = np.nan
+
+                ate = self._safe_nanmean(cls_store["ate"])
+                aoe = self._safe_nanmean(cls_store["aoe"])
+                ase = self._safe_nanmean(cls_store["ase"])
+                ave = self._safe_nanmean(cls_store["ave"])
+
+                detail[f"{metric_prefix}/{cls_name}_AP_dist_{thr_str}"] = ap
+                detail[f"{metric_prefix}/{cls_name}_ATE_dist_{thr_str}"] = ate
+                detail[f"{metric_prefix}/{cls_name}_AOE_dist_{thr_str}"] = aoe
+                detail[f"{metric_prefix}/{cls_name}_ASE_dist_{thr_str}"] = ase
+                detail[f"{metric_prefix}/{cls_name}_AVE_dist_{thr_str}"] = ave
+
+                class_ap_vals.append(ap)
+                class_ate_vals.append(ate)
+                class_aoe_vals.append(aoe)
+                class_ase_vals.append(ase)
+                class_ave_vals.append(ave)
+
+            ap_mean = self._safe_nanmean(class_ap_vals)
+            ate_mean = self._safe_nanmean(class_ate_vals)
+            aoe_mean = self._safe_nanmean(class_aoe_vals)
+            ase_mean = self._safe_nanmean(class_ase_vals)
+            ave_mean = self._safe_nanmean(class_ave_vals)
+
+            detail[f"{metric_prefix}/{cls_name}_AP_dist_mean"] = ap_mean
+            detail[f"{metric_prefix}/{cls_name}_ATE_dist_mean"] = ate_mean
+            detail[f"{metric_prefix}/{cls_name}_AOE_dist_mean"] = aoe_mean
+            detail[f"{metric_prefix}/{cls_name}_ASE_dist_mean"] = ase_mean
+            detail[f"{metric_prefix}/{cls_name}_AVE_dist_mean"] = ave_mean
+
+            detail[f"{metric_prefix}/{cls_name}_AP_dist_max"] = self._safe_nanmax(class_ap_vals)
+            detail[f"{metric_prefix}/{cls_name}_ATE_dist_max"] = self._safe_nanmax(class_ate_vals)
+            detail[f"{metric_prefix}/{cls_name}_AOE_dist_max"] = self._safe_nanmax(class_aoe_vals)
+            detail[f"{metric_prefix}/{cls_name}_ASE_dist_max"] = self._safe_nanmax(class_ase_vals)
+            detail[f"{metric_prefix}/{cls_name}_AVE_dist_max"] = self._safe_nanmax(class_ave_vals)
+
+            ap_cls_means.append(ap_mean)
+            ate_cls_means.append(ate_mean)
+            aoe_cls_means.append(aoe_mean)
+            ase_cls_means.append(ase_mean)
+            ave_cls_means.append(ave_mean)
+
+        mAP = self._safe_nanmean(ap_cls_means)
+        mATE = self._safe_nanmean(ate_cls_means)
+        mAOE = self._safe_nanmean(aoe_cls_means)
+        mASE = self._safe_nanmean(ase_cls_means)
+        mAVE = self._safe_nanmean(ave_cls_means)
+
+        detail[f"{metric_prefix}/mAP"] = mAP
+        detail[f"{metric_prefix}/mATE"] = mATE
+        detail[f"{metric_prefix}/mAOE"] = mAOE
+        detail[f"{metric_prefix}/mASE"] = mASE
+        detail[f"{metric_prefix}/mAVE"] = mAVE
+
+        s_mAP = 0.0 if np.isnan(mAP) else mAP
+        s_mATE = 0.0 if np.isnan(mATE) else max(0.0, 1.0 - mATE)
+        s_mAOE = 0.0 if np.isnan(mAOE) else max(0.0, 1.0 - mAOE)
+        s_mASE = 0.0 if np.isnan(mASE) else max(0.0, 1.0 - mASE)
+        s_mAVE = 0.0 if np.isnan(mAVE) else max(0.0, 1.0 - mAVE)
+        sds = (4.0 * s_mAP + s_mATE + s_mAOE + s_mASE + s_mAVE) / 8.0
+        detail[f"{metric_prefix}/SDS"] = float(sds)
+
+        print("\n" + "=" * 50)
+        print("SimBEV Evaluation Results:")
+        print(f"  mAP: {mAP}")
+        print(f"  mATE: {mATE}")
+        print(f"  mAOE: {mAOE}")
+        print(f"  mASE: {mASE}")
+        print(f"  mAVE: {mAVE}")
+        print(f"  SDS: {sds}")
+        print("=" * 50 + "\n")
+        return detail
+
+    def _evaluate_simbev(self, results, logger=None, jsonfile_prefix=None, **kwargs):
+        """Evaluate SimBEV predictions with selectable backend."""
+        use_numba_eval = kwargs.get("use_numba_eval", False)
+        if use_numba_eval:
+            return self._evaluate_simbev_numba(results, logger, jsonfile_prefix, **kwargs)
+        return self._evaluate_simbev_python(results, logger, jsonfile_prefix, **kwargs)
+
+    def _evaluate_simbev_python(self, results, logger=None, jsonfile_prefix=None, **kwargs):
+        """Evaluate SimBEV predictions with distance-based matching (Python backend)."""
+        print(f"Evaluating {len(results)} results (SimBEV, backend=python)...")
+        thresholds = [0.5, 1.0, 2.0, 4.0]
+        metric_prefix = "pts_bbox_SimBEV"
+        metrics_store = self._init_simbev_metrics_store(thresholds)
+
+        for i, result in enumerate(results):
+            info = self.data_infos[i]
+            pred = self._extract_pred_arrays(result)
+            gt = self._extract_gt_arrays(info["seq"], info["frame"], info["sensor"])
+
+            for cls_id in range(len(self.CLASSES)):
+                pred_mask = pred["labels"] == cls_id
+                gt_mask = gt["labels"] == cls_id
+
+                pred_centers = pred["centers"][pred_mask]
+                pred_sizes = pred["sizes"][pred_mask]
+                pred_yaws = pred["yaws"][pred_mask]
+                pred_scores = pred["scores"][pred_mask]
+                pred_velocities = None if pred["velocities"] is None else pred["velocities"][pred_mask]
+
+                gt_centers = gt["centers"][gt_mask]
+                gt_sizes = gt["sizes"][gt_mask]
+                gt_yaws = gt["yaws"][gt_mask]
+                gt_velocities = gt["velocities"][gt_mask]
+
+                if pred_scores.shape[0] > 0:
+                    order = np.argsort(-pred_scores)
+                    pred_centers = pred_centers[order]
+                    pred_sizes = pred_sizes[order]
+                    pred_yaws = pred_yaws[order]
+                    pred_scores = pred_scores[order]
+                    if pred_velocities is not None:
+                        pred_velocities = pred_velocities[order]
+
+                for thr in thresholds:
+                    cls_store = metrics_store[thr][cls_id]
+                    cls_store["num_gt"] += int(gt_centers.shape[0])
+
+                    assigned_gt = np.zeros(gt_centers.shape[0], dtype=bool)
+                    for pred_idx in range(pred_centers.shape[0]):
+                        cls_store["scores"].append(float(pred_scores[pred_idx]))
+                        if gt_centers.shape[0] == 0:
+                            cls_store["tp"].append(0.0)
+                            cls_store["fp"].append(1.0)
+                            continue
+
+                        dists = np.linalg.norm(gt_centers - pred_centers[pred_idx], axis=1)
+                        dists[assigned_gt] = np.inf
+                        matched_gt = int(np.argmin(dists))
+                        min_dist = float(dists[matched_gt])
+
+                        if np.isfinite(min_dist) and min_dist <= thr:
+                            assigned_gt[matched_gt] = True
+                            cls_store["tp"].append(1.0)
+                            cls_store["fp"].append(0.0)
+
+                            cls_store["ate"].append(min_dist)
+                            cls_store["aoe"].append(
+                                self._yaw_abs_diff(gt_yaws[matched_gt], pred_yaws[pred_idx])
+                            )
+
+                            # 1 - IoU with aligned center/yaw (size-only IoU approximation).
+                            pred_dims = pred_sizes[pred_idx]
+                            gt_dims = gt_sizes[matched_gt]
+                            min_dims = np.minimum(pred_dims, gt_dims)
+                            inter = float(np.prod(min_dims))
+                            pred_vol = float(np.prod(pred_dims))
+                            gt_vol = float(np.prod(gt_dims))
+                            union = pred_vol + gt_vol - inter
+                            ase = 1.0 - inter / max(union, 1e-6)
+                            cls_store["ase"].append(float(ase))
+
+                            if pred_velocities is None:
+                                cls_store["ave"].append(np.nan)
+                            else:
+                                pred_v = pred_velocities[pred_idx]
+                                gt_v = gt_velocities[matched_gt]
+                                if np.any(np.isnan(gt_v)):
+                                    cls_store["ave"].append(np.nan)
+                                else:
+                                    cls_store["ave"].append(float(np.linalg.norm(pred_v - gt_v)))
+                        else:
+                            cls_store["tp"].append(0.0)
+                            cls_store["fp"].append(1.0)
+
+        return self._finalize_simbev_metrics(metrics_store, thresholds, metric_prefix)
+
+    def _evaluate_simbev_numba(self, results, logger=None, jsonfile_prefix=None, **kwargs):
+        """Evaluate SimBEV predictions with numba-accelerated matching backend."""
+        if njit is None:
+            print("Numba is not available, falling back to python SimBEV evaluator.")
+            return self._evaluate_simbev_python(results, logger, jsonfile_prefix, **kwargs)
+
+        print(f"Evaluating {len(results)} results (SimBEV, backend=numba)...")
+        thresholds = [0.5, 1.0, 2.0, 4.0]
+        metric_prefix = "pts_bbox_SimBEV"
+        metrics_store = self._init_simbev_metrics_store(thresholds)
+
+        for i, result in enumerate(results):
+            info = self.data_infos[i]
+            pred = self._extract_pred_arrays(result)
+            gt = self._extract_gt_arrays(info["seq"], info["frame"], info["sensor"])
+
+            for cls_id in range(len(self.CLASSES)):
+                pred_mask = pred["labels"] == cls_id
+                gt_mask = gt["labels"] == cls_id
+
+                pred_centers = pred["centers"][pred_mask]
+                pred_sizes = pred["sizes"][pred_mask]
+                pred_yaws = pred["yaws"][pred_mask]
+                pred_scores = pred["scores"][pred_mask]
+                pred_velocities = None if pred["velocities"] is None else pred["velocities"][pred_mask]
+
+                gt_centers = gt["centers"][gt_mask]
+                gt_sizes = gt["sizes"][gt_mask]
+                gt_yaws = gt["yaws"][gt_mask]
+                gt_velocities = gt["velocities"][gt_mask]
+
+                if pred_scores.shape[0] > 0:
+                    order = np.argsort(-pred_scores)
+                    pred_centers = pred_centers[order]
+                    pred_sizes = pred_sizes[order]
+                    pred_yaws = pred_yaws[order]
+                    pred_scores = pred_scores[order]
+                    if pred_velocities is not None:
+                        pred_velocities = pred_velocities[order]
+
+                pred_centers_numba = np.asarray(pred_centers, dtype=np.float32)
+                gt_centers_numba = np.asarray(gt_centers, dtype=np.float32)
+
+                for thr in thresholds:
+                    cls_store = metrics_store[thr][cls_id]
+                    cls_store["num_gt"] += int(gt_centers.shape[0])
+
+                    tp, fp, matched_gt_idx, min_dists = _simbev_match_numba(
+                        pred_centers_numba, gt_centers_numba, float(thr)
+                    )
+                    cls_store["scores"].extend(pred_scores.astype(np.float32).tolist())
+                    cls_store["tp"].extend(tp.tolist())
+                    cls_store["fp"].extend(fp.tolist())
+
+                    for pred_idx in range(pred_centers.shape[0]):
+                        gt_idx = int(matched_gt_idx[pred_idx])
+                        if gt_idx < 0:
+                            continue
+
+                        cls_store["ate"].append(float(min_dists[pred_idx]))
+                        cls_store["aoe"].append(
+                            self._yaw_abs_diff(gt_yaws[gt_idx], pred_yaws[pred_idx])
+                        )
+
+                        pred_dims = pred_sizes[pred_idx]
+                        gt_dims = gt_sizes[gt_idx]
+                        min_dims = np.minimum(pred_dims, gt_dims)
+                        inter = float(np.prod(min_dims))
+                        pred_vol = float(np.prod(pred_dims))
+                        gt_vol = float(np.prod(gt_dims))
+                        union = pred_vol + gt_vol - inter
+                        ase = 1.0 - inter / max(union, 1e-6)
+                        cls_store["ase"].append(float(ase))
+
+                        if pred_velocities is None:
+                            cls_store["ave"].append(np.nan)
+                        else:
+                            pred_v = pred_velocities[pred_idx]
+                            gt_v = gt_velocities[gt_idx]
+                            if np.any(np.isnan(gt_v)):
+                                cls_store["ave"].append(np.nan)
+                            else:
+                                cls_store["ave"].append(float(np.linalg.norm(pred_v - gt_v)))
+
+        return self._finalize_simbev_metrics(metrics_store, thresholds, metric_prefix)
 
     def _evaluate_nusc(self, results, logger=None, jsonfile_prefix=None, **kwargs):
         """Evaluation in NuScenes protocol."""

@@ -39,6 +39,10 @@
 *   **解决**：
     *   **细化映射**：显式指定子类（`adult`, `child`, `police_officer` 等）以精确对齐官方 10 类。
     *   **缓存统计**：在 `load_annotations` 时预计算并缓存 `cat_ids`，加速 `CBGSDataset` 的初始化。
+    *   **缓存索引**：`load_annotations` 生成的 `data_infos` 会写入缓存文件，后续可直接加载，避免重复遍历与 GT 读取。
+        *   **自动区分数据集**：缓存 key 包含 `dataset_type/subset/split/sensor/classes/cat_mapping` 等，确保不同数据集或切分不会串用。
+        *   **默认位置**：`data_root/.cache/unified_mmdet3d/`。
+        *   **可控参数**：支持 `use_cache`、`cache_dir`、`cache_refresh`。
 
 ### D. 自动化评估集成 (Evaluation Support)
 *   **Global 转换**：利用 `tri3d.alignment(..., 'global')` 结合坐标修正矩阵，实现了从 $Native\_Lidar \to Tri3D\_Lidar \to Global$ 的自动转换。
