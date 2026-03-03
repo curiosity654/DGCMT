@@ -426,7 +426,8 @@ def build_data_from_dump(dump: dict, device: torch.device):
 
     data: dict = {}
     data['img'] = [img_tensor.unsqueeze(0)]
-    data['points'] = [pts_tensor.unsqueeze(0)]
+    # data['points'] = [pts_tensor.unsqueeze(0)]
+    data['points'] = [[pts_tensor]]
 
     # Build img_metas minimal dict
     metas_min = dump.get('img_metas_min', {})
@@ -630,6 +631,42 @@ def main():
     # Load model
     cfg = Config.fromfile(args.cfg)
     cfg.model.train_cfg = None
+
+    # import modules from plguin/xx, registry will be updated
+    if hasattr(cfg, 'plugin'):
+        if cfg.plugin:
+            import importlib
+            if hasattr(cfg, 'plugin_dir'):
+                plugin_dir = cfg.plugin_dir
+                if isinstance(plugin_dir, str):
+                    _module_dir = os.path.dirname(plugin_dir)
+                    _module_dir = _module_dir.split('/')
+                    _module_path = _module_dir[0]
+
+                    for m in _module_dir[1:]:
+                        _module_path = _module_path + '.' + m
+                    print(_module_path)
+                    plg_lib = importlib.import_module(_module_path)
+                elif isinstance(plugin_dir, (tuple, list)):
+                    for _plugin_dir in plugin_dir:
+                        _module_dir = os.path.dirname(_plugin_dir)
+                        _module_dir = _module_dir.split('/')
+                        _module_path = _module_dir[0]
+
+                        for m in _module_dir[1:]:
+                            _module_path = _module_path + '.' + m
+                        print(_module_path)
+                        plg_lib = importlib.import_module(_module_path)
+            else:
+                # import dir is the dirpath for the config file
+                _module_dir = os.path.dirname(args.config)
+                _module_dir = _module_dir.split('/')
+                _module_path = _module_dir[0]
+                for m in _module_dir[1:]:
+                    _module_path = _module_path + '.' + m
+                print(_module_path)
+                plg_lib = importlib.import_module(_module_path)
+
     model = build_detector(cfg.model, test_cfg=cfg.get('test_cfg'))
     load_checkpoint(model, args.ckpt, map_location='cpu')
     model.eval()
@@ -669,10 +706,17 @@ def main():
         except Exception as e:
             print(f'Failed to build GT boxes: {e}')
             gt_box_obj = None
+    elif args.show_gt:
+        print("Warning: --show-gt is enabled, but no GT found in dump "
+              "(missing 'gt_bboxes_3d' or 'gt_labels_3d'). "
+              "Please generate dump with pipeline_vis --gt on a split that has annotations.")
 
     # debug_attention_maps(output_dir, img_tensors, img_norm_cfg)
 
-    results = results[0]['pts_bbox']
+    if 'pts_bbox' in results[0]:
+        results = results[0]['pts_bbox']
+    else:
+        results = results[0]
     pred_bboxes = results['boxes_3d']
     pred_scores = results['scores_3d']
     pred_labels = results['labels_3d']
@@ -706,7 +750,8 @@ def main():
         )
 
     # Per-view 2D visualization
-    img_tensors = data['img'][0]
+    # img_tensors = data['img'][0]
+    img_tensors = data['img'][0].squeeze(0)
     num_views = img_tensors.shape[0]
     lidar2img_matrices = data['img_metas'][0][0]['lidar2img']
 
