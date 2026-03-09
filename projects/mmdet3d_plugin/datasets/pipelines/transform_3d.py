@@ -10,6 +10,7 @@ from numpy import random
 import torch
 import mmcv
 import cv2
+from PIL import Image
 
 from mmcv.utils import build_from_cfg
 from mmdet.datasets.builder import PIPELINES
@@ -629,6 +630,262 @@ class ResizeCropFlipImage(object):
         depth_map[depth_coords[valid_mask, 1], depth_coords[valid_mask, 0], :] = cam_depth[valid_mask, :]
 
         return depth_map
+
+
+@PIPELINES.register_module()
+class AV2ResizeCropFlipRotImageV2(object):
+    def __init__(self, data_aug_conf=None, multi_stamps=False, training=False):
+        self.data_aug_conf = data_aug_conf
+        self.min_size = 2.0
+        self.multi_stamps = multi_stamps
+        self.training = training
+
+    def __call__(self, results):
+        imgs = results['img']
+        num_imgs = len(imgs) // 2 if self.multi_stamps else len(imgs)
+        new_imgs = []
+        new_gt_bboxes = []
+        new_centers2d = []
+        new_gt_labels = []
+        new_depths = []
+        ida_mats = []
+
+        with_depthmap = 'depthmap' in results
+        if with_depthmap:
+            new_depthmaps = []
+
+        assert self.data_aug_conf['rot_lim'] == (0.0, 0.0), 'Rotation is not currently supported'
+
+        for i in range(num_imgs):
+            img_np = imgs[i]
+            height, width = img_np.shape[:2]
+
+            if height > width:
+                resize_f, resize_dims_f, crop_f = self._sample_augmentation_f(img_np)
+                img = Image.fromarray(np.uint8(img_np))
+                depthmap = Image.fromarray(results['depthmap'][i]) if with_depthmap else None
+                img, ida_mat_f, depthmap = self._img_transform(
+                    img, resize=resize_f, resize_dims=resize_dims_f, crop=crop_f, depthmap=depthmap)
+                img_first = np.array(img).astype(np.float32)
+
+                if 'gt_bboxes' in results and len(results['gt_bboxes']) > 0:
+                    gt_bboxes = results['gt_bboxes'][i]
+                    centers2d = results['centers2d'][i]
+                    gt_labels = results['gt_labels'][i]
+                    depths = results['depths'][i]
+                    if len(gt_bboxes) != 0:
+                        gt_bboxes, centers2d, gt_labels, depths = self._bboxes_transform(
+                            img_first, gt_bboxes, centers2d, gt_labels, depths, resize=resize_f, crop=crop_f)
+
+                resize, resize_dims, crop, flip, rotate = self._sample_augmentation(img_first)
+                img = Image.fromarray(np.uint8(img_first))
+                img, ida_mat, depthmap = self._img_transform(
+                    img, resize=resize, resize_dims=resize_dims, crop=crop,
+                    flip=flip, rotate=rotate, depthmap=depthmap)
+                img_out = np.array(img).astype(np.float32)
+
+                if 'gt_bboxes' in results and len(results['gt_bboxes']) > 0:
+                    if len(gt_bboxes) != 0:
+                        gt_bboxes, centers2d, gt_labels, depths = self._bboxes_transform(
+                            img_out, gt_bboxes, centers2d, gt_labels, depths,
+                            resize=resize, crop=crop, flip=flip)
+                    if len(gt_bboxes) != 0:
+                        gt_bboxes, centers2d, gt_labels, depths = self._filter_invisible(
+                            img_out, gt_bboxes, centers2d, gt_labels, depths)
+                    new_gt_bboxes.append(gt_bboxes)
+                    new_centers2d.append(centers2d)
+                    new_gt_labels.append(gt_labels)
+                    new_depths.append(depths)
+
+                new_imgs.append(img_out)
+                results['cam_intrinsic'][i][:3, :3] = (
+                    ida_mat @ ida_mat_f @ results['cam_intrinsic'][i][:3, :3]
+                )
+                ida_mats.append(np.array(ida_mat @ ida_mat_f))
+                if with_depthmap:
+                    new_depthmaps.append(np.array(depthmap))
+            else:
+                resize, resize_dims, crop, flip, rotate = self._sample_augmentation(img_np)
+                img = Image.fromarray(np.uint8(img_np))
+                depthmap = Image.fromarray(results['depthmap'][i]) if with_depthmap else None
+                img, ida_mat, depthmap = self._img_transform(
+                    img, resize=resize, resize_dims=resize_dims, crop=crop,
+                    flip=flip, rotate=rotate, depthmap=depthmap)
+                img_out = np.array(img).astype(np.float32)
+
+                if 'gt_bboxes' in results and len(results['gt_bboxes']) > 0:
+                    gt_bboxes = results['gt_bboxes'][i]
+                    centers2d = results['centers2d'][i]
+                    gt_labels = results['gt_labels'][i]
+                    depths = results['depths'][i]
+                    if len(gt_bboxes) != 0:
+                        gt_bboxes, centers2d, gt_labels, depths = self._bboxes_transform(
+                            img_out, gt_bboxes, centers2d, gt_labels, depths,
+                            resize=resize, crop=crop, flip=flip)
+                    if len(gt_bboxes) != 0:
+                        gt_bboxes, centers2d, gt_labels, depths = self._filter_invisible(
+                            img_out, gt_bboxes, centers2d, gt_labels, depths)
+                    new_gt_bboxes.append(gt_bboxes)
+                    new_centers2d.append(centers2d)
+                    new_gt_labels.append(gt_labels)
+                    new_depths.append(depths)
+
+                new_imgs.append(img_out)
+                results['cam_intrinsic'][i][:3, :3] = ida_mat @ results['cam_intrinsic'][i][:3, :3]
+                ida_mats.append(np.array(ida_mat))
+                if with_depthmap:
+                    new_depthmaps.append(np.array(depthmap))
+
+        if 'gt_bboxes' in results:
+            results['gt_bboxes'] = new_gt_bboxes
+            results['centers2d'] = new_centers2d
+            results['gt_labels'] = new_gt_labels
+            results['depths'] = new_depths
+        results['img'] = new_imgs
+        results['lidar2img'] = [
+            results['cam_intrinsic'][i] @ results['lidar2cam'][i]
+            for i in range(len(results['lidar2cam']))
+        ]
+        results['ori_shape'] = [img.shape for img in new_imgs]
+        results['img_shape'] = [img.shape for img in new_imgs]
+        results['pad_shape'] = [img.shape for img in new_imgs]
+        results['ida_mat'] = ida_mats
+
+        if with_depthmap:
+            results['depthmap'] = new_depthmaps
+
+        return results
+
+    def _bboxes_transform(self, img, bboxes, centers2d, gt_labels, depths, resize, crop, flip=False):
+        assert len(bboxes) == len(centers2d) == len(gt_labels) == len(depths)
+
+        final_h, final_w = img.shape[:2]
+        bboxes = bboxes * resize
+        bboxes[:, 0] -= crop[0]
+        bboxes[:, 1] -= crop[1]
+        bboxes[:, 2] -= crop[0]
+        bboxes[:, 3] -= crop[1]
+        bboxes[:, 0] = np.clip(bboxes[:, 0], 0, final_w)
+        bboxes[:, 2] = np.clip(bboxes[:, 2], 0, final_w)
+        bboxes[:, 1] = np.clip(bboxes[:, 1], 0, final_h)
+        bboxes[:, 3] = np.clip(bboxes[:, 3], 0, final_h)
+        keep = ((bboxes[:, 2] - bboxes[:, 0]) >= self.min_size) & (
+            (bboxes[:, 3] - bboxes[:, 1]) >= self.min_size)
+
+        if flip:
+            x0 = bboxes[:, 0].copy()
+            x1 = bboxes[:, 2].copy()
+            bboxes[:, 2] = final_w - x0
+            bboxes[:, 0] = final_w - x1
+        bboxes = bboxes[keep]
+
+        centers2d = centers2d * resize
+        centers2d[:, 0] -= crop[0]
+        centers2d[:, 1] -= crop[1]
+        centers2d[:, 0] = np.clip(centers2d[:, 0], 0, final_w)
+        centers2d[:, 1] = np.clip(centers2d[:, 1], 0, final_h)
+        if flip:
+            centers2d[:, 0] = final_w - centers2d[:, 0]
+
+        centers2d = centers2d[keep]
+        gt_labels = gt_labels[keep]
+        depths = depths[keep]
+        return bboxes, centers2d, gt_labels, depths
+
+    def _filter_invisible(self, img, bboxes, centers2d, gt_labels, depths):
+        assert len(bboxes) == len(centers2d) == len(gt_labels) == len(depths)
+
+        final_h, final_w = img.shape[:2]
+        indices_maps = np.zeros((final_h, final_w))
+        tmp_bboxes = np.zeros_like(bboxes)
+        tmp_bboxes[:, :2] = np.ceil(bboxes[:, :2])
+        tmp_bboxes[:, 2:] = np.floor(bboxes[:, 2:])
+        tmp_bboxes = tmp_bboxes.astype(np.int64)
+        sort_idx = np.argsort(-depths, axis=0, kind='stable')
+        tmp_bboxes = tmp_bboxes[sort_idx]
+        bboxes = bboxes[sort_idx]
+        depths = depths[sort_idx]
+        centers2d = centers2d[sort_idx]
+        gt_labels = gt_labels[sort_idx]
+        for i in range(bboxes.shape[0]):
+            u1, v1, u2, v2 = tmp_bboxes[i]
+            indices_maps[v1:v2, u1:u2] = i
+        indices_res = np.unique(indices_maps).astype(np.int64)
+        return bboxes[indices_res], centers2d[indices_res], gt_labels[indices_res], depths[indices_res]
+
+    def _get_rot(self, angle):
+        return torch.Tensor([[np.cos(angle), np.sin(angle)], [-np.sin(angle), np.cos(angle)]])
+
+    def _img_transform(self, img, resize, resize_dims, crop, flip=False, rotate=0, depthmap=None):
+        ida_rot = torch.eye(2)
+        ida_tran = torch.zeros(2)
+
+        img = img.resize(resize_dims)
+        img = img.crop(crop)
+        if flip:
+            img = img.transpose(method=Image.FLIP_LEFT_RIGHT)
+        img = img.rotate(rotate)
+
+        if depthmap is not None:
+            depthmap = depthmap.resize(resize_dims, resample=Image.NEAREST)
+            depthmap = depthmap.crop(crop)
+            if flip:
+                depthmap = depthmap.transpose(method=Image.FLIP_LEFT_RIGHT)
+            depthmap = depthmap.rotate(rotate, resample=Image.NEAREST)
+
+        ida_rot *= resize
+        ida_tran -= torch.Tensor(crop[:2])
+        if flip:
+            flip_mat = torch.Tensor([[-1, 0], [0, 1]])
+            flip_bias = torch.Tensor([crop[2] - crop[0], 0])
+            ida_rot = flip_mat.matmul(ida_rot)
+            ida_tran = flip_mat.matmul(ida_tran) + flip_bias
+        rot_mat = self._get_rot(rotate / 180 * np.pi)
+        rot_bias = torch.Tensor([crop[2] - crop[0], crop[3] - crop[1]]) / 2
+        rot_bias = rot_mat.matmul(-rot_bias) + rot_bias
+        ida_rot = rot_mat.matmul(ida_rot)
+        ida_tran = rot_mat.matmul(ida_tran) + rot_bias
+
+        ida_mat = torch.eye(3)
+        ida_mat[:2, :2] = ida_rot
+        ida_mat[:2, 2] = ida_tran
+        return img, ida_mat, depthmap
+
+    def _sample_augmentation(self, img):
+        height, width = img.shape[:2]
+        final_h, final_w = self.data_aug_conf['final_dim']
+        if self.training:
+            resize = np.random.uniform(*self.data_aug_conf['resize_lim'])
+            resize_dims = (int(width * resize), int(height * resize))
+            new_w, new_h = resize_dims
+            crop_h = int((1 - np.random.uniform(*self.data_aug_conf['bot_pct_lim'])) * new_h) - final_h
+            crop_w = int(np.random.uniform(0, max(0, new_w - final_w)))
+            crop = (crop_w, crop_h, crop_w + final_w, crop_h + final_h)
+            flip = False
+            if self.data_aug_conf['rand_flip'] and np.random.choice([0, 1]):
+                flip = True
+            rotate = np.random.uniform(*self.data_aug_conf['rot_lim'])
+        else:
+            resize = np.mean(self.data_aug_conf['resize_lim'])
+            resize_dims = (int(width * resize), int(height * resize))
+            new_w, new_h = resize_dims
+            crop_h = int((1 - np.mean(self.data_aug_conf['bot_pct_lim'])) * new_h) - final_h
+            crop_w = int(max(0, new_w - final_w) / 2)
+            crop = (crop_w, crop_h, crop_w + final_w, crop_h + final_h)
+            flip = False
+            rotate = 0
+        return resize, resize_dims, crop, flip, rotate
+
+    def _sample_augmentation_f(self, img):
+        height, width = img.shape[:2]
+        final_h, final_w = width, height
+        resize = np.round((height + 50) / width, 2)
+        resize_dims = (int(width * resize), int(height * resize))
+        new_w, new_h = resize_dims
+        crop_h = int((new_h - final_h) / 2)
+        crop_w = int((new_w - final_w) / 2)
+        crop = (crop_w, crop_h, crop_w + final_w, crop_h + final_h)
+        return resize, resize_dims, crop
 
 
 @PIPELINES.register_module()

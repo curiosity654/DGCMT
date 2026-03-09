@@ -133,23 +133,25 @@ def main():
             import importlib
             if hasattr(cfg, 'plugin_dir'):
                 plugin_dir = cfg.plugin_dir
-                _module_dir = os.path.dirname(plugin_dir)
-                _module_dir = _module_dir.split('/')
-                _module_path = _module_dir[0]
+                if isinstance(plugin_dir, str):
+                    _module_dir = os.path.dirname(plugin_dir)
+                    _module_dir = _module_dir.split('/')
+                    _module_path = _module_dir[0]
 
-                for m in _module_dir[1:]:
-                    _module_path = _module_path + '.' + m
-                print(_module_path)
-                plg_lib = importlib.import_module(_module_path)
-            else:
-                # import dir is the dirpath for the config file
-                _module_dir = os.path.dirname(args.config)
-                _module_dir = _module_dir.split('/')
-                _module_path = _module_dir[0]
-                for m in _module_dir[1:]:
-                    _module_path = _module_path + '.' + m
-                print(_module_path)
-                plg_lib = importlib.import_module(_module_path)
+                    for m in _module_dir[1:]:
+                        _module_path = _module_path + '.' + m
+                    print(_module_path)
+                    plg_lib = importlib.import_module(_module_path)
+                elif isinstance(plugin_dir, (tuple, list)):
+                    for _plugin_dir in plugin_dir:
+                        _module_dir = os.path.dirname(_plugin_dir)
+                        _module_dir = _module_dir.split('/')
+                        _module_path = _module_dir[0]
+
+                        for m in _module_dir[1:]:
+                            _module_path = _module_path + '.' + m
+                        print(_module_path)
+                        plg_lib = importlib.import_module(_module_path)
                 
     # plg_lib = importlib.import_module('mmdetection3d.mmdet3d')
 

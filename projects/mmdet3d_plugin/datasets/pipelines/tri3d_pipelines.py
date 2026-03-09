@@ -1,5 +1,6 @@
 import numpy as np
 import cv2
+import warnings
 from mmdet.datasets.builder import PIPELINES
 from mmdet3d.core.points import LiDARPoints
 from mmdet3d.core.bbox import LiDARInstance3DBoxes
@@ -121,6 +122,7 @@ class LoadMultiViewImageFromTri3D:
     """
     def __init__(self, undo_z_rotation=True):
         self.undo_z_rotation = undo_z_rotation
+        self._projection_warning_keys = set()
         if undo_z_rotation:
             self.undo_tri3d_rot = Rotation.from_euler("Z", np.pi / 2)
         else:
@@ -197,7 +199,17 @@ class LoadMultiViewImageFromTri3D:
                         cam_intrinsic[0, 2], cam_intrinsic[1, 2] = cx, cy
                     
                     lidar2img = cam_intrinsic @ lidar2cam
-            except:
+            except Exception as exc:
+                warning_key = (type(exc).__name__, str(exc), cam_sensor)
+                if warning_key not in self._projection_warning_keys:
+                    self._projection_warning_keys.add(warning_key)
+                    warnings.warn(
+                        "LoadMultiViewImageFromTri3D failed to build projection "
+                        f"for camera {cam_sensor} at seq={seq}, "
+                        f"lidar_frame={lidar_frame}, cam_frame={cam_frame}: {exc}. "
+                        "Falling back to identity transforms for this view.",
+                        RuntimeWarning,
+                    )
                 lidar2cam = lidar2img = cam_intrinsic = np.eye(4)
 
             lidar2cam_rts.append(lidar2cam)

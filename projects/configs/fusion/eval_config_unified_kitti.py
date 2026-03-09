@@ -9,6 +9,7 @@ class_names = [
     'car', 'truck', 'construction_vehicle', 'bus', 'trailer', 'barrier',
     'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone'
 ]
+kitti_eval_split = 'val'
 
 test_pipeline = [
     dict(
@@ -97,6 +98,7 @@ data = dict(
         split='training',
         pipeline=train_pipeline,
         classes=class_names,
+        kitti_eval_split=kitti_eval_split,
         modality=dict(
             use_lidar=True,
             use_camera=True,
@@ -116,6 +118,7 @@ data = dict(
         split='training',
         pipeline=test_pipeline,
         classes=class_names,
+        kitti_eval_split=kitti_eval_split,
         modality=dict(
             use_lidar=True,
             use_camera=True,
@@ -126,4 +129,8 @@ data = dict(
         box_type_3d='LiDAR',
         filter_empty_gt=False,
     )
+)
+
+evaluation = dict(
+    kitti_eval_split=kitti_eval_split,
 )

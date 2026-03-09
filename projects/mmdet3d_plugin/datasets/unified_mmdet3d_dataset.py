@@ -281,6 +281,7 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
                  use_cache=True,
                  cache_dir=None,
                  cache_refresh=False,
+                 kitti_eval_split=None,
                  **kwargs):
         # 1. Initialize Tri3D dataset
 
@@ -326,6 +327,7 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
         self.use_cache = use_cache
         self.cache_dir = cache_dir
         self.cache_refresh = cache_refresh
+        self.kitti_eval_split = kitti_eval_split
         self.box_type_3d, self.box_mode_3d = get_box_type(box_type_3d)
 
         self.CLASSES = self.get_classes(classes)
@@ -363,6 +365,7 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
             'load_interval': self.load_interval,
             'classes': list(self.CLASSES),
             'cat_mapping': dict(self.cat_mapping),
+            'kitti_eval_split': self.kitti_eval_split,
         }
 
     def _get_cache_path(self, sensor):
@@ -419,6 +422,27 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
                         is_keyframes=is_keyframes,
                     )
                 )
+
+        if self.dataset_type_name == 'KITTI' and self.kitti_eval_split is not None:
+            split_frame_ids, split_path = self._load_kitti_eval_frame_ids(self.kitti_eval_split)
+            if split_frame_ids is None:
+                print(
+                    f"KITTI data split '{self.kitti_eval_split}' not found; "
+                    f"keep all {len(indexed_frames)} indexed frames."
+                )
+            else:
+                filtered_frames = []
+                for item in indexed_frames:
+                    frame_id = self._normalize_kitti_frame_id(
+                        self.tri3d_dataset._frame_id(item["frame"])
+                    )
+                    if frame_id in split_frame_ids:
+                        filtered_frames.append(item)
+                print(
+                    f"KITTI data frame filter enabled: {len(filtered_frames)}/"
+                    f"{len(indexed_frames)} indexed frames from {split_path}"
+                )
+                indexed_frames = filtered_frames
 
         indexed_frames = indexed_frames[::self.load_interval]
 
@@ -709,6 +733,34 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
             "labels": labels,
         }
 
+    def _tri3d_box_to_model_space(self, box):
+        """Match Tri3D GT box conversion with the training data pipeline."""
+        center = np.asarray(box.center, dtype=np.float32).copy()
+        heading = float(box.heading)
+        size = np.asarray(box.size, dtype=np.float32).copy()
+
+        # SimBEV shares the same rotated LiDAR convention as the NuScenes-backed
+        # Tri3D loaders, so evaluation GTs must undo that rotation exactly the
+        # same way as LoadAnnotationsFromTri3D.
+        if self.dataset_type_name in ("NuScenes", "SimBEV"):
+            undo_rot = Rotation.from_euler("Z", np.pi / 2).as_matrix()[:3, :3]
+            center = undo_rot @ center
+            heading = heading + np.pi / 2
+
+            velocity = getattr(box, "velocity", None)
+            if velocity is not None:
+                velocity = undo_rot @ np.asarray(velocity, dtype=np.float32)
+        else:
+            velocity = getattr(box, "velocity", None)
+            if velocity is not None:
+                velocity = np.asarray(velocity, dtype=np.float32)
+
+        # LiDARInstance3DBoxes stores bottom-center internally, and model
+        # predictions are exported in that convention as well.
+        center[2] -= size[2] * 0.5
+
+        return center, heading, size, velocity
+
     def _extract_gt_arrays(self, seq, frame, sensor):
         """Extract GT arrays from Tri3D boxes for a single sample."""
         boxes = self.tri3d_dataset.boxes(seq, frame, coords=sensor)
@@ -724,19 +776,18 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
             if mapped_label is None or mapped_label not in self.CLASSES:
                 continue
 
+            center, heading, size, velocity = self._tri3d_box_to_model_space(box)
             cls_id = self.CLASSES.index(mapped_label)
             gt_label_ids.append(cls_id)
-            gt_centers.append(np.asarray(box.center, dtype=np.float32))
-            gt_yaws.append(float(box.heading))
-            gt_sizes.append(np.asarray(box.size, dtype=np.float32))
+            gt_centers.append(center)
+            gt_yaws.append(heading)
+            gt_sizes.append(size)
 
-            vel = getattr(box, "velocity", None)
-            if vel is None:
+            if velocity is None:
                 gt_velocities.append(np.array([np.nan, np.nan], dtype=np.float32))
             else:
-                vel = np.asarray(vel, dtype=np.float32)
-                if vel.shape[0] >= 2:
-                    gt_velocities.append(vel[:2])
+                if velocity.shape[0] >= 2:
+                    gt_velocities.append(velocity[:2])
                 else:
                     gt_velocities.append(np.array([np.nan, np.nan], dtype=np.float32))
 
@@ -1453,6 +1504,47 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
 
     # ==================== KITTI Evaluation Methods ====================
 
+    def _normalize_kitti_frame_id(self, frame_id):
+        """Normalize KITTI frame id to 6-digit format for matching."""
+        frame_id = str(frame_id).strip()
+        if not frame_id:
+            return None
+        return frame_id.zfill(6) if frame_id.isdigit() else frame_id
+
+    def _resolve_kitti_split_path(self, split_name_or_path):
+        """Resolve split spec to an ImageSets txt path."""
+        if split_name_or_path is None:
+            return None
+
+        split_value = str(split_name_or_path).strip()
+        if not split_value:
+            return None
+
+        split_path = Path(split_value)
+        if split_path.is_file():
+            return split_path
+
+        image_sets_dir = Path(self.data_root) / "ImageSets"
+        if split_path.suffix == ".txt":
+            candidate = image_sets_dir / split_path.name
+        else:
+            candidate = image_sets_dir / f"{split_value}.txt"
+        return candidate if candidate.is_file() else None
+
+    def _load_kitti_eval_frame_ids(self, split_name_or_path):
+        """Load KITTI frame ids from ImageSets split file."""
+        split_path = self._resolve_kitti_split_path(split_name_or_path)
+        if split_path is None:
+            return None, None
+
+        frame_ids = set()
+        with open(split_path, "r", encoding="utf-8") as f:
+            for line in f:
+                frame_id = self._normalize_kitti_frame_id(line)
+                if frame_id is not None:
+                    frame_ids.add(frame_id)
+        return frame_ids, split_path
+
     def _load_kitti_gts(self):
         """Load KITTI ground truth annotations from label_2 files."""
         gt_annos = []
@@ -1647,6 +1739,35 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
         det_annos = self._format_results_kitti(results, jsonfile_prefix)
         gt_annos = self._load_kitti_gts()
 
+        eval_split = kwargs.get("kitti_eval_split", None)
+        if eval_split is None:
+            eval_split = kwargs.get("kitti_split", None)
+        if eval_split is None:
+            eval_split = self.kitti_eval_split
+
+        split_frame_ids, split_path = self._load_kitti_eval_frame_ids(eval_split)
+        if eval_split is not None:
+            if split_frame_ids is None:
+                print(
+                    f"KITTI eval split '{eval_split}' not found; "
+                    f"use all {len(det_annos)} frames."
+                )
+            else:
+                keep_indices = []
+                for idx, info in enumerate(self.data_infos):
+                    frame_id = self._normalize_kitti_frame_id(
+                        self.tri3d_dataset._frame_id(info["frame"])
+                    )
+                    if frame_id in split_frame_ids:
+                        keep_indices.append(idx)
+
+                det_annos = [det_annos[i] for i in keep_indices]
+                gt_annos = [gt_annos[i] for i in keep_indices]
+                print(
+                    f"KITTI eval frame filter enabled: {len(keep_indices)}/"
+                    f"{len(self.data_infos)} frames from {split_path}"
+                )
+
         ap_result_str, ap_dict = kitti_eval(
             gt_annos,
             det_annos,
@@ -1747,7 +1868,7 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
         dts = pd.DataFrame(all_boxes)
         
         # Sort by score descending
-        dts = dts.sort_values("score", ascending=False)
+        dts = dts.sort_values("score", ascending=False).reset_index(drop=True)
         
         # Save if prefix provided
         if jsonfile_prefix is not None:
