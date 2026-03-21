@@ -20,6 +20,23 @@ from mmdet3d.datasets.builder import OBJECTSAMPLERS
 
 
 @PIPELINES.register_module()
+class DropPointsDim(object):
+    """Drop point feature dimensions by keeping selected indices."""
+
+    def __init__(self, keep_dims):
+        self.keep_dims = keep_dims
+
+    def __call__(self, input_dict):
+        input_dict['points'] = input_dict['points'][:, self.keep_dims]
+        return input_dict
+
+    def __repr__(self):
+        repr_str = self.__class__.__name__
+        repr_str += f'(keep_dims={self.keep_dims})'
+        return repr_str
+
+
+@PIPELINES.register_module()
 class PadMultiViewImage(object):
     """Pad the multi-view image.
     There are two padding modes: (1) pad to a fixed size and (2) pad to the
