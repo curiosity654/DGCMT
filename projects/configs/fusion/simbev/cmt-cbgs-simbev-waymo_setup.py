@@ -1,5 +1,6 @@
 # CMT Fusion Configuration for SimBEV Dataset
 # This config uses UnifiedMMDet3DDataset with SimBEV dataset
+# backed by the Waymo-style SimBEV setup.
 
 plugin = True
 plugin_dir = 'projects/mmdet3d_plugin/'
@@ -13,7 +14,7 @@ out_size_factor = 8
 evaluation = dict(interval=4)
 dataset_type = 'UnifiedMMDet3DDataset'
 # data_root = 'data/simbev/'
-data_root = 'data/simbev/generated/nuscenes_trainval/worker_0/simbev'
+data_root = 'data/simbev/generated/316_sync/waymo_trainval/worker_0/simbev'
 input_modality = dict(
     use_lidar=True,
     use_camera=True,
@@ -41,12 +42,15 @@ train_pipeline = [
         load_dim=5,
         use_dim=[0, 1, 2, 3, 4],
         sweeps_num=0,  # SimBEV doesn't have sweeps
+        undo_z_rotation=False,
     ),
     dict(
         type='LoadMultiViewImageFromTri3D',
+        undo_z_rotation=False,
     ),
     dict(
-        type='LoadAnnotationsFromTri3D', 
+        type='LoadAnnotationsFromTri3D',
+        undo_z_rotation=False,
     ),
     dict(type='ModalMask3D', mode='train'),
     dict(
@@ -85,8 +89,9 @@ test_pipeline = [
         load_dim=5,
         use_dim=[0, 1, 2, 3, 4],
         sweeps_num=0,
+        undo_z_rotation=False,
     ),
-    dict(type='LoadMultiViewImageFromTri3D'),
+    dict(type='LoadMultiViewImageFromTri3D', undo_z_rotation=False),
     dict(type='PointsRangeFilter', point_cloud_range=point_cloud_range),
     dict(
         type='MultiScaleFlipAug3D',
