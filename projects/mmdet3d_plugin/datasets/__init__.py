@@ -1,3 +1,4 @@
 from .custom_nuscenes_dataset import CustomNuScenesDataset
+from .custom_nuscenes_3class_dataset import CustomNuScenes3ClassDataset
 from .unified_mmdet3d_dataset import UnifiedMMDet3DDataset
 from .pipelines import *
