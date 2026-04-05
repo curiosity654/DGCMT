@@ -360,7 +360,7 @@ log_config = dict(
     hooks=[dict(type='TextLoggerHook'),
            dict(type='TensorboardLoggerHook'),
            dict(type='WandbLoggerHook',init_kwargs=dict(project='DGFusion', name='cmt_voxel0075_vov_1600x640_cbgs',))])
-dist_params = dict(backend='nccl')
+dist_params = dict(backend='gloo')
 log_level = 'INFO'
 work_dir = None
 load_from='checkpoints/fcos3d_vovnet_imgbackbone-remapped.pth'
