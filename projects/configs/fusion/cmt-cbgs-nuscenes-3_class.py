@@ -177,3 +177,18 @@ model = dict(
         bbox_coder=dict(num_classes=3),
     )
 )
+
+log_config = dict(
+    interval=50,
+    hooks=[
+        dict(type="TextLoggerHook"),
+        dict(type="TensorboardLoggerHook"),
+        dict(
+            type="WandbLoggerHook",
+            init_kwargs=dict(
+                project="DGFusion",
+                name="cmt-cbgs-nuscenes-3_class",
+            ),
+        ),
+    ],
+)

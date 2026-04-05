@@ -8,6 +8,7 @@ import warnings
 from os import path as osp
 
 import mmcv
+import swanlab
 import torch
 import torch.distributed as dist
 from mmcv import Config, DictAction
@@ -28,6 +29,8 @@ try:
     from mmdet.utils import setup_multi_processes
 except ImportError:
     from mmdet3d.utils import setup_multi_processes
+
+swanlab.sync_wandb()
 
 
 def parse_args():
