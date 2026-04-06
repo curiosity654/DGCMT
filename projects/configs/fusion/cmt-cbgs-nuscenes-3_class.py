@@ -192,3 +192,13 @@ log_config = dict(
         ),
     ],
 )
+
+custom_hooks = [
+    dict(
+        type="DropAugmentationHook",
+        drop_epoch=15,
+        pipeline_name="UnifiedObjectSample",
+    ),
+]
+
+resume_from = "work_dirs/cmt-cbgs-nuscenes-3_class/epoch_15.pth"
