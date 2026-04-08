@@ -18,6 +18,39 @@ TWO_WHEELER_CATEGORIES = {
     "BICYCLIST",
     "MOTORCYCLE",
     "MOTORCYCLIST",
+    "WHEELED_RIDER",
+}
+
+ARGO_3CLASS_EVAL_CATEGORIES = ("VEHICLE", "CYCLIST", "PEDESTRIAN")
+
+ARGO_3CLASS_VEHICLE_CATEGORIES = {
+    "VEHICLE",
+    "CAR",
+    "TRUCK",
+    "CONSTRUCTION_VEHICLE",
+    "BUS",
+    "TRAILER",
+    "REGULAR_VEHICLE",
+    "LARGE_VEHICLE",
+    "BOX_TRUCK",
+    "TRUCK_CAB",
+    "ARTICULATED_BUS",
+    "SCHOOL_BUS",
+    "VEHICULAR_TRAILER",
+}
+
+ARGO_3CLASS_CYCLIST_CATEGORIES = {
+    "CYCLIST",
+    "BICYCLE",
+    "MOTORCYCLE",
+    "BICYCLIST",
+    "MOTORCYCLIST",
+    "WHEELED_RIDER",
+}
+
+ARGO_3CLASS_PEDESTRIAN_CATEGORIES = {
+    "PEDESTRIAN",
+    "OFFICIAL_SIGNALER",
 }
 
 NUSC_TO_WAYMO_MAPPING = {
@@ -42,10 +75,16 @@ def parse_args():
     parser.add_argument("--path", required=True, help="results file in feather format")
     parser.add_argument("--argo2-root", default="./data/argo2/argo2_format/")
     parser.add_argument(
+        "--argo-eval-mode",
+        choices=["official", "3class"],
+        default="official",
+        help="AV2 evaluation ontology: official fine-grained classes or aggregated 3-class eval",
+    )
+    parser.add_argument(
         "--categories",
         nargs="+",
         default=None,
-        help="optional category whitelist, e.g. REGULAR_VEHICLE PEDESTRIAN BICYCLIST",
+        help="optional category whitelist, e.g. REGULAR_VEHICLE PEDESTRIAN or VEHICLE CYCLIST PEDESTRIAN",
     )
     parser.add_argument(
         "--merge-two-wheelers",
@@ -70,41 +109,65 @@ def _normalize_waymo_category(category):
     return NUSC_TO_WAYMO_MAPPING.get(cat.lower())
 
 
+def _normalize_argo_3class_category(category):
+    cat = str(category).strip().upper()
+    if cat in ARGO_3CLASS_VEHICLE_CATEGORIES:
+        return "VEHICLE"
+    if cat in ARGO_3CLASS_CYCLIST_CATEGORIES:
+        return "CYCLIST"
+    if cat in ARGO_3CLASS_PEDESTRIAN_CATEGORIES:
+        return "PEDESTRIAN"
+    return None
+
+
 def run_argo_eval(args):
-    from av2.evaluation.detection.constants import HIERARCHY
-    from av2.evaluation.detection.eval import evaluate
-    from av2.evaluation.detection.utils import DetectionCfg
     from av2.utils.io import read_feather
-
-    try:
-        from av2.evaluation.detection.constants import CompetitionCategories
-
-        eval_categories = set(x.value for x in CompetitionCategories)
-    except ImportError:
-        # Newer av2 versions remove CompetitionCategories.
-        eval_categories = set(HIERARCHY["FINEGRAIN"])
 
     dts = read_feather(Path(args.path))
     dts["category"] = dts["category"].astype(str).str.upper()
-    dts = dts.set_index(["log_id", "timestamp_ns"]).sort_index()
     argo2_root = args.argo2_root
     val_anno_path = osp.join(argo2_root, "sensor/val_anno.feather")
     gts = read_feather(Path(val_anno_path))
     gts["category"] = gts["category"].astype(str).str.upper()
+
+    if args.argo_eval_mode == "3class":
+        from projects.mmdet3d_plugin.datasets.av2_evaluation import (
+            DetectionCfg,
+            evaluate,
+        )
+
+        dts["category"] = dts["category"].map(_normalize_argo_3class_category)
+        gts["category"] = gts["category"].map(_normalize_argo_3class_category)
+        dts = dts[dts["category"].notna()].copy()
+        gts = gts[gts["category"].notna()].copy()
+        eval_categories = set(ARGO_3CLASS_EVAL_CATEGORIES)
+    else:
+        from av2.evaluation.detection.constants import HIERARCHY
+        from av2.evaluation.detection.eval import evaluate
+        from av2.evaluation.detection.utils import DetectionCfg
+
+        try:
+            from av2.evaluation.detection.constants import CompetitionCategories
+
+            eval_categories = set(x.value for x in CompetitionCategories)
+        except ImportError:
+            # Newer av2 versions remove CompetitionCategories.
+            eval_categories = set(HIERARCHY["FINEGRAIN"])
+
+        merged_two_wheelers_name = args.merged_two_wheelers_name.upper()
+        if args.merge_two_wheelers:
+            dts["category"] = dts["category"].replace(
+                {k: merged_two_wheelers_name for k in TWO_WHEELER_CATEGORIES}
+            )
+            gts["category"] = gts["category"].replace(
+                {k: merged_two_wheelers_name for k in TWO_WHEELER_CATEGORIES}
+            )
+        eval_categories = set(x.upper() for x in eval_categories)
+        if args.merge_two_wheelers:
+            eval_categories = eval_categories | {merged_two_wheelers_name}
+
+    dts = dts.set_index(["log_id", "timestamp_ns"]).sort_index()
     gts = gts.set_index(["log_id", "timestamp_ns"]).sort_values("category")
-
-    merged_two_wheelers_name = args.merged_two_wheelers_name.upper()
-    if args.merge_two_wheelers:
-        dts["category"] = dts["category"].replace(
-            {k: merged_two_wheelers_name for k in TWO_WHEELER_CATEGORIES}
-        )
-        gts["category"] = gts["category"].replace(
-            {k: merged_two_wheelers_name for k in TWO_WHEELER_CATEGORIES}
-        )
-
-    eval_categories = set(x.upper() for x in eval_categories)
-    if args.merge_two_wheelers:
-        eval_categories = eval_categories | {merged_two_wheelers_name}
     requested_categories = None
     if args.categories:
         requested_categories = set(c.upper() for c in args.categories)
@@ -123,27 +186,40 @@ def run_argo_eval(args):
     categories = set(gts["category"].unique().tolist()) & eval_categories
     if requested_categories is not None:
         categories &= requested_categories
+    if not categories:
+        raise ValueError("No valid AV2 categories left after remapping/filtering.")
 
     split = "val"
     dataset_dir = Path(argo2_root) / "sensor" / split
-    try:
+    if args.argo_eval_mode == "3class":
         cfg = DetectionCfg(
             dataset_dir=dataset_dir,
             categories=tuple(sorted(categories)),
-            split=split,
-            max_range_m=200.0,
             eval_only_roi_instances=True,
+            eval_range_m=(0.0, 150.0),
         )
-    except TypeError:
-        cfg = DetectionCfg(
-            dataset_dir=dataset_dir,
-            categories=tuple(sorted(categories)),
-            max_range_m=200.0,
-            eval_only_roi_instances=True,
-        )
+    else:
+        try:
+            cfg = DetectionCfg(
+                dataset_dir=dataset_dir,
+                categories=tuple(sorted(categories)),
+                split=split,
+                max_range_m=200.0,
+                eval_only_roi_instances=True,
+            )
+        except TypeError:
+            cfg = DetectionCfg(
+                dataset_dir=dataset_dir,
+                categories=tuple(sorted(categories)),
+                max_range_m=200.0,
+                eval_only_roi_instances=True,
+            )
 
-    print("Start Argo evaluation ...")
-    _, _, metrics = evaluate(dts.reset_index(), gts.reset_index(), cfg)
+    print(f"Start Argo evaluation ({args.argo_eval_mode}) ...")
+    if args.argo_eval_mode == "3class":
+        _, _, metrics, _ = evaluate(dts.reset_index(), gts.reset_index(), cfg)
+    else:
+        _, _, metrics = evaluate(dts.reset_index(), gts.reset_index(), cfg)
     valid_categories = sorted(categories) + ["AVERAGE_METRICS"]
     print(metrics.loc[valid_categories])
 
