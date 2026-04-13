@@ -187,7 +187,7 @@ log_config = dict(
             type="WandbLoggerHook",
             init_kwargs=dict(
                 project="Dataset_Generalize_Fusion",
-                name="cmt-cbgs-nuscenes-3_class",
+                name="cmt-cbgs-nuscenes-xyz-3_class",
             ),
         ),
     ],
