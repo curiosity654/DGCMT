@@ -9,6 +9,7 @@ import json
 import os
 import os.path as osp
 import pickle
+import sys
 from copy import deepcopy
 
 import cv2
@@ -31,6 +32,10 @@ BOX_EDGES = [
     (0, 4), (1, 5), (2, 6), (3, 7),
 ]
 
+REPO_ROOT = osp.dirname(osp.dirname(osp.abspath(__file__)))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -40,8 +45,7 @@ def parse_args():
     parser.add_argument(
         '--split',
         default='test',
-        choices=['train', 'val', 'test'],
-        help='Dataset split in cfg.data')
+        help='Dataset split key in cfg.data, e.g. train/val/test/vis')
     parser.add_argument('--index', type=int, default=0, help='Sample index')
     parser.add_argument('--device', default='cuda:0', help='Inference device')
     parser.add_argument('--score-thr', type=float, default=0.0)
@@ -115,8 +119,40 @@ def prepare_model_inputs(sample, model):
         data = scatter(data, [device_index])[0]
     else:
         for k, v in list(data.items()):
-            if isinstance(v, list) and len(v) > 0 and hasattr(v[0], 'data'):
+            if isinstance(v, DataContainer):
+                data[k] = v.data
+            elif isinstance(v, list) and len(v) > 0 and hasattr(v[0], 'data'):
                 data[k] = v[0].data
+
+    # CMT forward_test expects test-time augmentation nesting:
+    #   img: [Tensor]
+    #   points: [list[BasePoints]]
+    #   img_metas: [list[dict]]
+    for k, v in list(data.items()):
+        if isinstance(v, DataContainer):
+            data[k] = v.data
+
+    if 'img' in data and not isinstance(data['img'], list):
+        data['img'] = [data['img']]
+
+    if 'points' in data:
+        points = data['points']
+        if not isinstance(points, list):
+            data['points'] = [[points]]
+        elif len(points) > 0 and not isinstance(points[0], (list, tuple)):
+            data['points'] = [points]
+
+    if 'img_metas' in data:
+        img_metas = data['img_metas']
+        if not isinstance(img_metas, list):
+            data['img_metas'] = [[img_metas]]
+        elif len(img_metas) > 0 and isinstance(img_metas[0], dict):
+            data['img_metas'] = [img_metas]
+
+    for key in (
+            'gt_bboxes_3d', 'gt_labels_3d', 'gt_labels', 'gt_bboxes',
+            'gt_bboxes_ignore'):
+        data.pop(key, None)
     return data
 
 

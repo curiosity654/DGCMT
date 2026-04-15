@@ -11,6 +11,8 @@ This document summarizes the Waymo-related changes and operational notes from th
 - Added Waymo visualization config `projects/configs/fusion/vis_config_unified_waymo.py`.
 - Added Waymo evaluation config `projects/configs/fusion/eval_config_unified_waymo.py`.
   - Uses the same padding strategy as the vis config (`PadMultiViewImage` with `size='same2max'`).
+- Added Waymo inference config `projects/configs/fusion/infer_config_unified_waymo.py`.
+  - Intended for plain inference plus result export without running Waymo evaluation.
 - Updated `projects/mmdet3d_plugin/datasets/pipelines/tri3d_pipelines.py` to skip camera sensors with empty timelines (Waymo validation has 5 active cameras and 3 empty ones). This avoids `IndexError` during image loading.
 - Updated Tri3D Waymo dataset init to accept `timeline_root` (original layout) while reading actual data from `data_root` (optimized layout).
 - Added `tri3d_kwargs` passthrough in `UnifiedMMDet3DDataset` so configs can forward `timeline_root`.
@@ -103,3 +105,18 @@ conda run -n dgcmt-codex python tools/test.py \
   projects/configs/fusion/eval_config_unified_waymo.py \
   /path/to/ckpt.pth --eval bbox
 ```
+
+Inference + export only (Waymo):
+
+```bash
+conda run -n dgcmt-codex python tools/test.py \
+  projects/configs/fusion/infer_config_unified_waymo.py \
+  /path/to/ckpt.pth \
+  --format-only \
+  --result-prefix work_dirs/waymo_infer/preds
+```
+
+This writes dataset-formatted Waymo detections to
+`work_dirs/waymo_infer/preds_waymo_dts.feather`. If `--result-prefix` is
+omitted but `--out` is provided, `tools/test.py` now reuses the `--out`
+basename as the export prefix automatically.

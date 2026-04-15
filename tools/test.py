@@ -40,6 +40,10 @@ def parse_args():
     parser.add_argument('checkpoint', help='checkpoint file')
     parser.add_argument('--out', help='output result file in pickle format')
     parser.add_argument(
+        '--result-prefix',
+        help='prefix for dataset-specific formatted results, e.g. Waymo '
+        'feather export')
+    parser.add_argument(
         '--fuse-conv-bn',
         action='store_true',
         help='Whether to fuse conv and bn, this will slightly increase'
@@ -282,6 +286,11 @@ def main():
             print(f'\nwriting results to {args.out}')
             mmcv.dump(outputs, args.out)
         kwargs = {} if args.eval_options is None else args.eval_options
+        if 'jsonfile_prefix' not in kwargs:
+            if args.result_prefix:
+                kwargs['jsonfile_prefix'] = args.result_prefix
+            elif args.out and (args.format_only or args.eval):
+                kwargs['jsonfile_prefix'] = os.path.splitext(args.out)[0]
         if args.format_only:
             dataset.format_results(outputs, **kwargs)
         if args.eval:
