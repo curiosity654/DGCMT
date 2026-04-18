@@ -80,7 +80,7 @@ Waymo parquet files optimized by `thirdparty/tri3d/tri3d/datasets/optimize_waymo
 Create it with:
 
 ```bash
-python create_waymo_timeline.py --src data/waymo --dst data/waymo_timeline --slim --strict
+python tools/create_waymo_timeline.py --src data/waymo --dst data/waymo_timeline --slim --strict
 ```
 
 Notes:
