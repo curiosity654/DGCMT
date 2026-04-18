@@ -285,7 +285,15 @@ def main():
         if args.out:
             print(f'\nwriting results to {args.out}')
             mmcv.dump(outputs, args.out)
-        kwargs = {} if args.eval_options is None else args.eval_options
+        cfg_eval_kwargs = cfg.get('evaluation', {}).copy()
+        for key in [
+                'interval', 'tmpdir', 'start', 'gpu_collect', 'save_best',
+                'rule'
+        ]:
+            cfg_eval_kwargs.pop(key, None)
+        kwargs = cfg_eval_kwargs
+        if args.eval_options is not None:
+            kwargs.update(args.eval_options)
         if 'jsonfile_prefix' not in kwargs:
             if args.result_prefix:
                 kwargs['jsonfile_prefix'] = args.result_prefix
@@ -294,14 +302,7 @@ def main():
         if args.format_only:
             dataset.format_results(outputs, **kwargs)
         if args.eval:
-            eval_kwargs = cfg.get('evaluation', {}).copy()
-            # hard-code way to remove EvalHook args
-            for key in [
-                    'interval', 'tmpdir', 'start', 'gpu_collect', 'save_best',
-                    'rule'
-            ]:
-                eval_kwargs.pop(key, None)
-            eval_kwargs.update(dict(metric=args.eval, **kwargs))
+            eval_kwargs = dict(metric=args.eval, **kwargs)
             print(dataset.evaluate(outputs, **eval_kwargs))
 
 

@@ -16,6 +16,12 @@ from pyquaternion import Quaternion
 from tri3d.geometry import RigidTransform, Rotation
 from tqdm import tqdm
 
+from .unieval_prediction_package import (build_prediction_manifest,
+                                         normalize_argo_3class_category,
+                                         normalize_nuscenes_3class_category,
+                                         write_prediction_package,
+                                         yaw_to_quaternion)
+
 try:
     from numba import njit
 except Exception:  # noqa: BLE001
@@ -170,6 +176,7 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
     # NuScenes 10-class to Argoverse2 mapping (for evaluation)
     NUSC_TO_AV2_MAPPING = {
         'car': 'REGULAR_VEHICLE',
+        'vehicle': 'REGULAR_VEHICLE',
         'truck': 'TRUCK',
         'construction_vehicle': 'LARGE_VEHICLE',
         'bus': 'BUS',
@@ -195,6 +202,7 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
     # NuScenes 10-class to KITTI mapping (for evaluation)
     NUSC_TO_KITTI_MAPPING = {
         'car': 'Car',
+        'vehicle': 'Car',
         'truck': 'Van',
         'construction_vehicle': 'Van',
         'bus': 'Van',
@@ -215,6 +223,7 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
     # NuScenes 10-class to Waymo mapping (for evaluation)
     NUSC_TO_WAYMO_MAPPING = {
         'car': 'VEHICLE',
+        'vehicle': 'VEHICLE',
         'truck': 'VEHICLE',
         'construction_vehicle': 'VEHICLE',
         'bus': 'VEHICLE',
@@ -649,8 +658,38 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
             nusc_annos.append(nusc_anno)
         return nusc_annos
 
-    def format_results(self, outputs, jsonfile_prefix=None):
+    def _resolve_unieval_common_kwargs(self,
+                                       kwargs,
+                                       *,
+                                       default_label_space,
+                                       default_coord_system,
+                                       default_box_origin,
+                                       default_source_codebase='dgcmt',
+                                       default_task='detection'):
+        return dict(
+            export_unieval_package=bool(
+                kwargs.get('export_unieval_package', False)),
+            format_only=bool(kwargs.get('format_only', False)),
+            export_dir=kwargs.get('export_dir'),
+            export_split=kwargs.get('export_split'),
+            label_space=kwargs.get('label_space', default_label_space),
+            coord_system=kwargs.get('coord_system', default_coord_system),
+            box_origin=kwargs.get('box_origin', default_box_origin),
+            source_codebase=kwargs.get('source_codebase',
+                                       default_source_codebase),
+            task=kwargs.get('task', default_task),
+        )
+
+    def format_results(self, outputs, jsonfile_prefix=None, **kwargs):
         """Format the results based on dataset type."""
+        if kwargs.get('export_unieval_package', False):
+            if self.dataset_type_name == 'Argoverse2':
+                return self._export_av2_unieval_package(outputs, **kwargs)
+            if self.dataset_type_name == 'KITTI':
+                return self._export_kitti_unieval_package(outputs, **kwargs)
+            if self.dataset_type_name == 'Waymo':
+                return self._export_waymo_unieval_package(outputs, **kwargs)
+
         if self.dataset_type_name == 'Argoverse2':
             return self._format_results_av2(outputs, jsonfile_prefix)
         elif self.dataset_type_name == 'KITTI':
@@ -1267,7 +1306,11 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
 
     # ==================== Waymo Evaluation Methods ====================
 
-    def _format_bbox_waymo(self, results, log_id, timestamp_micros):
+    def _format_bbox_waymo(self,
+                           results,
+                           log_id,
+                           timestamp_micros,
+                           label_space='waymo:official'):
         """Convert predictions to a simple Waymo-like format for one frame."""
         if "pts_bbox" in results:
             bboxes = results["pts_bbox"]["boxes_3d"]
@@ -1287,7 +1330,12 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
             x, y, z, l, w, h, yaw = bboxes_tensor[i, :7]
             z_center = z + h / 2.0
             cls_name = self.CLASSES[labels[i]]
-            waymo_cls = self.NUSC_TO_WAYMO_MAPPING.get(cls_name, 'UNKNOWN')
+            if label_space == 'unified:3class':
+                waymo_cls = normalize_nuscenes_3class_category(cls_name)
+            else:
+                waymo_cls = self.NUSC_TO_WAYMO_MAPPING.get(cls_name, 'UNKNOWN')
+            if waymo_cls is None:
+                continue
 
             waymo_boxes.append({
                 'center_x': float(x),
@@ -1304,23 +1352,73 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
             })
         return waymo_boxes
 
-    def _format_results_waymo(self, outputs, jsonfile_prefix=None):
-        """Format all predictions to a simple Waymo-like DataFrame."""
-        print(f"Formatting {len(outputs)} results for Waymo...")
-        all_boxes = []
+    def _build_waymo_unieval_dataframe(self,
+                                       outputs,
+                                       label_space='waymo:official'):
+        rows = []
+        valid_frames = set()
         for i, out in enumerate(outputs):
             info = self.data_infos[i]
             log_id = info.get('log_id')
             timestamp_micros = info.get('timestamp_micros')
             if log_id is None or timestamp_micros is None:
                 continue
-            all_boxes.extend(self._format_bbox_waymo(out, log_id, timestamp_micros))
+            valid_frames.add((str(log_id), int(timestamp_micros)))
+            rows.extend(
+                self._format_bbox_waymo(
+                    out,
+                    log_id,
+                    timestamp_micros,
+                    label_space=label_space))
 
-        if len(all_boxes) == 0:
+        columns = [
+            'log_id', 'timestamp_micros', 'center_x', 'center_y', 'center_z',
+            'length', 'width', 'height', 'heading', 'score', 'category'
+        ]
+        return pd.DataFrame(rows, columns=columns), len(valid_frames)
+
+    def _resolve_waymo_unieval_dir(self, export_dir=None, export_split=None):
+        if export_dir is not None:
+            return export_dir
+        split_name = export_split or self.split or getattr(
+            self.tri3d_dataset, 'split', None) or 'validation'
+        return osp.join(self.data_root, 'unieval_packages', f'waymo_{split_name}')
+
+    def _export_waymo_unieval_package(self, outputs, **kwargs):
+        export_kwargs = self._resolve_unieval_common_kwargs(
+            kwargs,
+            default_label_space='waymo:official',
+            default_coord_system='lidar',
+            default_box_origin='gravity_center')
+        payload, num_frames = self._build_waymo_unieval_dataframe(
+            outputs, label_space=export_kwargs['label_space'])
+        manifest = build_prediction_manifest(
+            dataset='waymo',
+            task=export_kwargs['task'],
+            split=export_kwargs['export_split'] or self.split or 'validation',
+            source_codebase=export_kwargs['source_codebase'],
+            label_space=export_kwargs['label_space'],
+            coord_system=export_kwargs['coord_system'],
+            box_origin=export_kwargs['box_origin'])
+        package_info = write_prediction_package(
+            self._resolve_waymo_unieval_dir(
+                export_dir=export_kwargs['export_dir'],
+                export_split=export_kwargs['export_split']),
+            manifest,
+            payload)
+        return {
+            'waymo_unieval/path': package_info['package_dir'],
+            'waymo_unieval/num_boxes': int(len(payload)),
+            'waymo_unieval/num_frames': int(num_frames),
+        }
+
+    def _format_results_waymo(self, outputs, jsonfile_prefix=None):
+        """Format all predictions to a simple Waymo-like DataFrame."""
+        print(f"Formatting {len(outputs)} results for Waymo...")
+        dts, _ = self._build_waymo_unieval_dataframe(outputs)
+        if dts.empty:
             print("Warning: No boxes to format!")
             return pd.DataFrame()
-
-        dts = pd.DataFrame(all_boxes).sort_values("score", ascending=False).reset_index(drop=True)
         if jsonfile_prefix is not None:
             prefix_dir = osp.dirname(jsonfile_prefix)
             if prefix_dir:
@@ -1337,6 +1435,11 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
     def _evaluate_waymo(self, results, logger=None, jsonfile_prefix=None, **kwargs):
         """Evaluation in Waymo protocol via official WOD metrics."""
         print(f"Evaluating {len(results)} results (Waymo)...")
+        export_metrics = {}
+        if kwargs.get('export_unieval_package', False):
+            export_metrics = self._export_waymo_unieval_package(results, **kwargs)
+            if kwargs.get('format_only', False):
+                return export_metrics
         try:
             import tensorflow as tf
             from waymo_open_dataset import label_pb2
@@ -1500,6 +1603,7 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
             if key in detail:
                 print(f"{key}: {detail[key]:.4f}")
         print("=" * 80 + "\n")
+        detail.update(export_metrics)
         return detail
 
     # ==================== KITTI Evaluation Methods ====================
@@ -1731,11 +1835,114 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
 
         return det_annos
 
+    def _format_bbox_kitti_unieval(self,
+                                   results,
+                                   frame_id,
+                                   label_space='unified:3class'):
+        if "pts_bbox" in results:
+            bboxes = results["pts_bbox"]["boxes_3d"]
+            scores = results["pts_bbox"]["scores_3d"]
+            labels = results["pts_bbox"]["labels_3d"]
+        else:
+            bboxes = results["boxes_3d"]
+            scores = results["scores_3d"]
+            labels = results["labels_3d"]
+
+        bboxes_tensor = bboxes.tensor.cpu().numpy()
+        scores = scores.cpu().numpy()
+        labels = labels.cpu().numpy()
+
+        rows = []
+        for i in range(len(bboxes_tensor)):
+            x, y, z, l, w, h, yaw = bboxes_tensor[i, :7]
+            cls_name = self.CLASSES[labels[i]]
+            if label_space == 'unified:3class':
+                category = normalize_nuscenes_3class_category(cls_name)
+            else:
+                category = cls_name
+            if category is None:
+                continue
+            rows.append(
+                dict(
+                    frame_id=str(frame_id),
+                    center_x=float(x),
+                    center_y=float(y),
+                    center_z=float(z),
+                    length=float(l),
+                    width=float(w),
+                    height=float(h),
+                    yaw=float(yaw),
+                    score=float(scores[i]),
+                    category=str(category),
+                ))
+        return rows
+
+    def _build_kitti_unieval_dataframe(self,
+                                       outputs,
+                                       label_space='unified:3class'):
+        rows = []
+        valid_frames = set()
+        for i, out in enumerate(outputs):
+            frame_id = self._normalize_kitti_frame_id(
+                self.tri3d_dataset._frame_id(self.data_infos[i]['frame']))
+            if frame_id is None:
+                continue
+            valid_frames.add(frame_id)
+            rows.extend(
+                self._format_bbox_kitti_unieval(
+                    out, frame_id, label_space=label_space))
+
+        columns = [
+            'frame_id', 'center_x', 'center_y', 'center_z', 'length', 'width',
+            'height', 'yaw', 'score', 'category'
+        ]
+        return pd.DataFrame(rows, columns=columns), len(valid_frames)
+
+    def _resolve_kitti_unieval_dir(self, export_dir=None, export_split=None):
+        if export_dir is not None:
+            return export_dir
+        split_name = export_split or self.kitti_eval_split or self.split or 'training'
+        return osp.join(self.data_root, 'unieval_packages', f'kitti_{split_name}')
+
+    def _export_kitti_unieval_package(self, outputs, **kwargs):
+        export_kwargs = self._resolve_unieval_common_kwargs(
+            kwargs,
+            default_label_space='unified:3class',
+            default_coord_system='lidar',
+            default_box_origin='bottom_center')
+        payload, num_frames = self._build_kitti_unieval_dataframe(
+            outputs, label_space=export_kwargs['label_space'])
+        manifest = build_prediction_manifest(
+            dataset='kitti',
+            task=export_kwargs['task'],
+            split=export_kwargs['export_split'] or self.kitti_eval_split
+            or self.split or 'training',
+            source_codebase=export_kwargs['source_codebase'],
+            label_space=export_kwargs['label_space'],
+            coord_system=export_kwargs['coord_system'],
+            box_origin=export_kwargs['box_origin'])
+        package_info = write_prediction_package(
+            self._resolve_kitti_unieval_dir(
+                export_dir=export_kwargs['export_dir'],
+                export_split=export_kwargs['export_split']),
+            manifest,
+            payload)
+        return {
+            'kitti_unieval/path': package_info['package_dir'],
+            'kitti_unieval/num_boxes': int(len(payload)),
+            'kitti_unieval/num_frames': int(num_frames),
+        }
+
     def _evaluate_kitti(self, results, logger=None, jsonfile_prefix=None, **kwargs):
         """Evaluation in KITTI protocol."""
         from mmdet3d.core.evaluation import kitti_eval
 
         print(f"Evaluating {len(results)} results (KITTI)...")
+        export_metrics = {}
+        if kwargs.get('export_unieval_package', False):
+            export_metrics = self._export_kitti_unieval_package(results, **kwargs)
+            if kwargs.get('format_only', False):
+                return export_metrics
         det_annos = self._format_results_kitti(results, jsonfile_prefix)
         gt_annos = self._load_kitti_gts()
 
@@ -1780,6 +1987,7 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
         for ap_type, ap in ap_dict.items():
             detail[f'pts_bbox_KITTI/{ap_type}'] = float('{:.4f}'.format(ap))
 
+        detail.update(export_metrics)
         return detail
     # ==================== Argoverse2 Evaluation Methods ====================
 
@@ -1793,7 +2001,11 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
         qz = np.sin(half_yaw)
         return np.array([qw, qx, qy, qz])
 
-    def _format_bbox_av2(self, results, log_id, timestamp_ns):
+    def _format_bbox_av2(self,
+                         results,
+                         log_id,
+                         timestamp_ns,
+                         label_space='argoverse2:official'):
         """Convert predictions to Argoverse2 format for a single frame."""
         if "pts_bbox" in results:
             bboxes = results["pts_bbox"]["boxes_3d"]
@@ -1819,11 +2031,15 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
             z_center = z + h / 2.0  # Move from bottom to center
             
             # Convert yaw to quaternion
-            quat = self._yaw_to_quat(yaw)
+            quat = yaw_to_quaternion(float(yaw))
             
             # Map NuScenes class to AV2 class
             cls_name = self.CLASSES[labels[i]]
             av2_cls = self.NUSC_TO_AV2_MAPPING.get(cls_name, cls_name.upper())
+            if label_space == 'unified:3class':
+                av2_cls = normalize_argo_3class_category(av2_cls)
+                if av2_cls is None:
+                    continue
             
             av2_boxes.append({
                 'tx_m': x,
@@ -1844,29 +2060,39 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
         
         return av2_boxes
 
-    def _format_results_av2(self, outputs, jsonfile_prefix=None):
-        """Format the results to Argoverse2 DataFrame format."""
-        print(f"Formatting {len(outputs)} results for Argoverse2...")
-        
-        all_boxes = []
+    def _build_av2_dataframe(self,
+                             outputs,
+                             label_space='argoverse2:official'):
+        rows = []
+        valid_frames = set()
         for i, out in enumerate(outputs):
             info = self.data_infos[i]
             log_id = info.get('log_id')
             timestamp_ns = info.get('timestamp_ns')
-            
+
             if log_id is None or timestamp_ns is None:
                 continue
-            
-            frame_boxes = self._format_bbox_av2(out, log_id, timestamp_ns)
-            all_boxes.extend(frame_boxes)
-        
-        if len(all_boxes) == 0:
+            valid_frames.add((str(log_id), int(timestamp_ns)))
+            rows.extend(
+                self._format_bbox_av2(
+                    out,
+                    log_id,
+                    timestamp_ns,
+                    label_space=label_space))
+
+        columns = [
+            'tx_m', 'ty_m', 'tz_m', 'length_m', 'width_m', 'height_m', 'qw',
+            'qx', 'qy', 'qz', 'score', 'log_id', 'timestamp_ns', 'category'
+        ]
+        return pd.DataFrame(rows, columns=columns), len(valid_frames)
+
+    def _format_results_av2(self, outputs, jsonfile_prefix=None):
+        """Format the results to Argoverse2 DataFrame format."""
+        print(f"Formatting {len(outputs)} results for Argoverse2...")
+        dts, _ = self._build_av2_dataframe(outputs)
+        if dts.empty:
             print("Warning: No boxes to format!")
             return pd.DataFrame()
-        
-        # Create DataFrame
-        dts = pd.DataFrame(all_boxes)
-        
         # Sort by score descending
         dts = dts.sort_values("score", ascending=False).reset_index(drop=True)
         
@@ -1885,6 +2111,41 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
         dts = dts.set_index(["log_id", "timestamp_ns"]).sort_index()
         
         return dts
+
+    def _resolve_av2_unieval_dir(self, export_dir=None, export_split=None):
+        if export_dir is not None:
+            return export_dir
+        split_name = export_split or self.split or getattr(
+            self.tri3d_dataset, 'split', None) or 'val'
+        return osp.join(self.data_root, 'unieval_packages', f'argo2_{split_name}')
+
+    def _export_av2_unieval_package(self, outputs, **kwargs):
+        export_kwargs = self._resolve_unieval_common_kwargs(
+            kwargs,
+            default_label_space='unified:3class',
+            default_coord_system='lidar',
+            default_box_origin='gravity_center')
+        payload, num_frames = self._build_av2_dataframe(
+            outputs, label_space=export_kwargs['label_space'])
+        manifest = build_prediction_manifest(
+            dataset='argo2',
+            task=export_kwargs['task'],
+            split=export_kwargs['export_split'] or self.split or 'val',
+            source_codebase=export_kwargs['source_codebase'],
+            label_space=export_kwargs['label_space'],
+            coord_system=export_kwargs['coord_system'],
+            box_origin=export_kwargs['box_origin'])
+        package_info = write_prediction_package(
+            self._resolve_av2_unieval_dir(
+                export_dir=export_kwargs['export_dir'],
+                export_split=export_kwargs['export_split']),
+            manifest,
+            payload)
+        return {
+            'av2_unieval/path': package_info['package_dir'],
+            'av2_unieval/num_boxes': int(len(payload)),
+            'av2_unieval/num_frames': int(num_frames),
+        }
 
     def _load_av2_annotations(self):
         """Load Argoverse2 ground truth annotations."""
@@ -1951,6 +2212,11 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
     def _evaluate_av2(self, results, logger=None, jsonfile_prefix=None, eval_range_m=None, **kwargs):
         """Evaluation in Argoverse2 protocol."""
         print(f"Evaluating {len(results)} results (Argoverse2)...")
+        export_metrics = {}
+        if kwargs.get('export_unieval_package', False):
+            export_metrics = self._export_av2_unieval_package(results, **kwargs)
+            if kwargs.get('format_only', False):
+                return export_metrics
         
         if jsonfile_prefix is None:
             tmp_dir = tempfile.TemporaryDirectory()
@@ -2042,6 +2308,7 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
         if tmp_dir is not None:
             tmp_dir.cleanup()
         
+        detail.update(export_metrics)
         return detail
 
     def _basic_av2_metrics(self, dts, gts):

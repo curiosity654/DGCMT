@@ -2,13 +2,19 @@
 # Copyright (c) 2023 megvii-model. All Rights Reserved.
 # ------------------------------------------------------------------------
 
-import numpy as np
 import mmcv
+import numpy as np
+import os.path as osp
+import pandas as pd
 
 from mmdet.datasets import DATASETS
 from mmdet3d.core.bbox import LiDARInstance3DBoxes
 
 from .custom_nuscenes_dataset import CustomNuScenesDataset
+from .unieval_prediction_package import (build_prediction_manifest,
+                                         normalize_nuscenes_3class_category,
+                                         write_prediction_package,
+                                         yaw_to_quaternion)
 
 
 def _safe_nanmean(values):
@@ -390,6 +396,113 @@ class CustomNuScenes3ClassDataset(CustomNuScenesDataset):
             metrics_store, list(self.CLASSES), self.distance_thresholds, metric_prefix
         )
 
+    def _resolve_unieval_kwargs(self, kwargs):
+        return dict(
+            export_unieval_package=bool(
+                kwargs.get('export_unieval_package', False)),
+            format_only=bool(kwargs.get('format_only', False)),
+            export_dir=kwargs.get('export_dir'),
+            export_split=kwargs.get('export_split', 'val'),
+            label_space=kwargs.get('label_space', 'unified:3class'),
+            coord_system=kwargs.get('coord_system', 'lidar'),
+            box_origin=kwargs.get('box_origin', 'bottom_center'),
+            source_codebase=kwargs.get('source_codebase', 'dgcmt'),
+            task=kwargs.get('task', 'detection'),
+        )
+
+    def _build_unieval_payload(self, results):
+        rows = []
+        valid_samples = set()
+        for sample_id, det in enumerate(results):
+            if "pts_bbox" in det:
+                det = det["pts_bbox"]
+
+            sample_token = self.data_infos[sample_id].get("token")
+            if sample_token is None:
+                continue
+            valid_samples.add(str(sample_token))
+
+            pred = _boxes_to_pred_dict(det)
+            valid_mask = (pred["labels"] >= 0) & (pred["labels"] < len(self.CLASSES))
+            for key in ["centers", "sizes", "yaws", "velocities", "scores", "labels"]:
+                pred[key] = pred[key][valid_mask]
+
+            for idx in range(pred["labels"].shape[0]):
+                cls_name = self.CLASSES[int(pred["labels"][idx])]
+                category = normalize_nuscenes_3class_category(cls_name)
+                if category is None:
+                    continue
+                qw, qx, qy, qz = yaw_to_quaternion(float(pred["yaws"][idx]))
+                vx = float(pred["velocities"][idx, 0])
+                vy = float(pred["velocities"][idx, 1])
+                if not np.isfinite(vx):
+                    vx = 0.0
+                if not np.isfinite(vy):
+                    vy = 0.0
+                rows.append(
+                    dict(
+                        sample_token=str(sample_token),
+                        center_x=float(pred["centers"][idx, 0]),
+                        center_y=float(pred["centers"][idx, 1]),
+                        center_z=float(pred["centers"][idx, 2]),
+                        length=float(pred["sizes"][idx, 0]),
+                        width=float(pred["sizes"][idx, 1]),
+                        height=float(pred["sizes"][idx, 2]),
+                        qw=qw,
+                        qx=qx,
+                        qy=qy,
+                        qz=qz,
+                        vx=vx,
+                        vy=vy,
+                        score=float(pred["scores"][idx]),
+                        category=str(category),
+                    ))
+
+        columns = [
+            'sample_token', 'center_x', 'center_y', 'center_z', 'length',
+            'width', 'height', 'qw', 'qx', 'qy', 'qz', 'vx', 'vy', 'score',
+            'category'
+        ]
+        return pd.DataFrame(rows, columns=columns), len(valid_samples)
+
+    def _resolve_unieval_export_dir(self, export_dir=None, export_split='val'):
+        if export_dir is not None:
+            return export_dir
+        return osp.join(self.data_root, 'unieval_packages',
+                        f'nuscenes_3class_{export_split}')
+
+    def _export_unieval_package(self, results, **kwargs):
+        export_kwargs = self._resolve_unieval_kwargs(kwargs)
+        payload, num_samples = self._build_unieval_payload(results)
+        manifest = build_prediction_manifest(
+            dataset='nuscenes',
+            task=export_kwargs['task'],
+            split=export_kwargs['export_split'],
+            source_codebase=export_kwargs['source_codebase'],
+            label_space=export_kwargs['label_space'],
+            coord_system=export_kwargs['coord_system'],
+            box_origin=export_kwargs['box_origin'],
+        )
+        package_info = write_prediction_package(
+            self._resolve_unieval_export_dir(
+                export_dir=export_kwargs['export_dir'],
+                export_split=export_kwargs['export_split'],
+            ),
+            manifest,
+            payload,
+        )
+        return {
+            'nuscenes_unieval/path': package_info['package_dir'],
+            'nuscenes_unieval/num_boxes': int(len(payload)),
+            'nuscenes_unieval/num_samples': int(num_samples),
+        }
+
+    def format_results(self, results, jsonfile_prefix=None, **kwargs):
+        if kwargs.get('export_unieval_package', False):
+            return self._export_unieval_package(results, **kwargs)
+        return super(CustomNuScenes3ClassDataset, self).format_results(
+            results, jsonfile_prefix)
+
     def evaluate(
         self,
         results,
@@ -400,6 +513,7 @@ class CustomNuScenes3ClassDataset(CustomNuScenesDataset):
         show=False,
         out_dir=None,
         pipeline=None,
+        **kwargs,
     ):
         del metric, logger, jsonfile_prefix
         assert isinstance(results, list), "results must be a list"
@@ -412,6 +526,12 @@ class CustomNuScenes3ClassDataset(CustomNuScenesDataset):
         if len(results) == 0:
             return {}
 
+        export_metrics = {}
+        if kwargs.get('export_unieval_package', False):
+            export_metrics = self._export_unieval_package(results, **kwargs)
+            if kwargs.get('format_only', False):
+                return export_metrics
+
         if not ("pts_bbox" in results[0] or "img_bbox" in results[0]):
             results_dict = self._evaluate_single(results, "pts_bbox")
         else:
@@ -422,6 +542,7 @@ class CustomNuScenes3ClassDataset(CustomNuScenesDataset):
                 print("Evaluating bboxes of {}".format(name))
                 results_dict.update(self._evaluate_single([out[name] for out in results], name))
 
+        results_dict.update(export_metrics)
         if show or out_dir:
             self.show(results, out_dir, show=show, pipeline=pipeline)
         return results_dict
