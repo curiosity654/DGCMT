@@ -508,10 +508,9 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
             elif self.dataset_type_name == 'Waymo':
                 # log_id is the record name in Tri3D Waymo
                 data_info['log_id'] = self.tri3d_dataset.records[seq]
-                # Waymo metrics expect microseconds
-                data_info['timestamp_micros'] = int(
-                    self.tri3d_dataset.timestamps(seq, sensor)[frame] * 1e6
-                )
+                data_info['timestamp_micros'] = \
+                    self._waymo_official_frame_timestamp_micros(
+                        seq, frame, sensor)
 
             data_infos.append(data_info)
         
@@ -520,6 +519,12 @@ class UnifiedMMDet3DDataset(Custom3DDataset):
             mmcv.dump({'meta': cache_meta, 'data_infos': data_infos}, cache_path)
             print(f"Saved data_infos cache to {cache_path}")
         return data_infos
+
+    def _waymo_official_frame_timestamp_micros(self, seq, frame_idx, sensor):
+        # Tri3D's Waymo lidar timelines are stored at sweep middle time,
+        # while official Waymo frame keys use the sweep start timestamp.
+        timestamp_seconds = self.tri3d_dataset.timestamps(seq, sensor)[frame_idx]
+        return int(round((float(timestamp_seconds) - 0.05) * 1e6))
 
     def get_data_info(self, index):
         info = self.data_infos[index]
